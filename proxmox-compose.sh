@@ -628,13 +628,6 @@ for SERVICE_LINE in "${SERVICES[@]}"; do
                 NEW_VOL_CONFIG=$(pct config $CURRENT_VMID | grep "^mp$MP_INDEX:")
                 # Format: mp0: local-zfs:vm-800-disk-1,mp=/data,...
                 PROXMOX_VOLID=$(echo "$NEW_VOL_CONFIG" | sed -E 's/^mp[0-9]+: ([^,]+).*/\1/')
-                
-                if [ -z "$PROXMOX_VOLID" ]; then
-                    echo "Error: Failed to identify new volume ID for $V_SOURCE"
-                    exit 1
-                fi
-                echo "Identified new volume: $PROXMOX_VOLID"
-                GLOBAL_VOL_MAP[$V_SOURCE]="$PROXMOX_VOLID"
             fi
             
             # Log for metadata (JSON object)
