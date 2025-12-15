@@ -527,7 +527,7 @@ for SERVICE_LINE in "${SERVICES[@]}"; do
     # Generate deterministic filename for the template
     # Replace non-alphanumeric chars with underscore, add .tar extension
     CLEAN_IMAGE_NAME=$(echo "$S_IMAGE" | tr -c 'a-zA-Z0-9.-' '_')
-    TARGET_FILENAME="pmxc_${CLEAN_IMAGE_NAME}.tar"
+    TARGET_FILENAME="pmxc_${CLEAN_IMAGE_NAME}"
     
     echo "Pulling image '$S_IMAGE' to $TEMPLATE_STORAGE on $TARGET_NODE as '$TARGET_FILENAME'..."
     PULL_OUTPUT=$(pvesh create /nodes/$TARGET_NODE/storage/$TEMPLATE_STORAGE/oci-registry-pull --reference "$S_IMAGE" --filename "$TARGET_FILENAME" 2>&1 || true)
