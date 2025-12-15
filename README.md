@@ -11,11 +11,18 @@ A shell utility to deploy `docker-compose.yml` services as native OCI-based LXC 
 
 ## Installation
 
-1.  Copy `proxmox-compose.sh` to your Proxmox host.
-2.  Make it executable:
-    ```bash
-    chmod +x proxmox-compose.sh
-    ```
+Run the following command on your Proxmox host:
+
+```bash
+bash -c "$(curl -fsSL https://github.com/chrisnlarsen/proxmox-compose/raw/refs/heads/main/proxmox-compose.sh)"
+```
+
+Alternatively, you can manually download `proxmox-compose.sh` and run it:
+
+```bash
+chmod +x proxmox-compose.sh
+./proxmox-compose.sh
+```
 
 ## Usage
 
