@@ -581,7 +581,9 @@ for SERVICE_LINE in "${SERVICES[@]}"; do
         --rootfs "$ROOTFS_STORAGE:$CLEAN_VOL_SIZE" \
         --features nesting=1 \
         --unprivileged 1 \
-        --start 0 
+        --features nesting=1 \
+        --unprivileged 1 \
+        --start 0 || { echo "Error: Failed to create container $CURRENT_VMID"; exit 1; }
 
     # --- 5. Post-Creation Volume Attachment (pct set) ---
     echo "Processing volumes..."
@@ -625,7 +627,7 @@ for SERVICE_LINE in "${SERVICES[@]}"; do
         
         # Execute pct set
         if [ -n "$MOUNT_STR" ]; then
-            pct set $CURRENT_VMID "-mp$MP_INDEX" "$MOUNT_STR"
+            pct set $CURRENT_VMID "-mp$MP_INDEX" "$MOUNT_STR" || { echo "Error: Failed to attach volume $V_SOURCE to $CURRENT_VMID"; exit 1; }
              
             # If we just created a new allocated volume, we MUST find its ID
             if [ "$IS_NEW_ALLOCATION" == "true" ]; then
