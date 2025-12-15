@@ -47,14 +47,24 @@ chmod +x proxmox-compose.sh
 *   **Automatic Image Pulling**: Uses Proxmox API (`pvesh`) to pull OCI images from the registry defined in your compose file.
 *   **Advanced Networking**: Auto-detects available bridges from `/etc/network/interfaces`. Supports both DHCP and Static IP configuration per deployment.
 *   **Persistent Volumes**: Supports standard bindings (`./data:/data`) and global named volumes. Automatically allocates virtual disks on Proxmox storage and attaches them to containers.
+*   **Update Workflow**: **New!** Includes a "Update Project" option to safely detach persistent volumes, destroy only the container, pull the latest image, and re-deploy while preserving your data.
 *   **Environment Variables**: Parses `environment` sections and injects them into the container configuration (`lxc.environment`).
 *   **Container Creation**: Automatically creates unprivileged LXC containers for each service.
 
-## Limitations
+## Limitations & Known Issues
 
+*   **OCI Extraction Errors**: Some images (e.g., `postgres:14-alpine`, some `node` images) fail to extract on Proxmox/LXC due to hardlink handling on ZFS. This presents as `IO error: failed to unpack ... File exists`.
+    *   *Workaround*: Try using a different base image (e.g., `debian`) or wait for upstream Proxmox fixes.
 *   **Restart Policies**: Does not currently map `restart` policies to Proxmox startup options.
 
-## Troubleshooting
+## Disclaimer
 
-*   **Image Pull Fails**: If the script hangs or fails to pull, check if you can pull the image manually via the Proxmox GUI > Storage > CT Templates > Pull from OCI Registry.
-*   **Template Not Found**: If the script cannot find the template after pulling, you may need to manually enter the path when prompted (e.g., `local:vztmpl/my-image.tar.zst`).
+**Not affiliated with Proxmox Server Solutions GmbH.**
+This is a community project created to explore OCI container orchestration on Proxmox VE. Use at your own risk.
+
+**AI-Assisted Creation**
+This software was developed with the assistance of advanced AI coding agents. While verified for functionality, please review the code before running it in production environments.
+
+## License
+
+MIT License. See [LICENSE](LICENSE) for details.
