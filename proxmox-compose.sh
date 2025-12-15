@@ -596,33 +596,26 @@ for SERVICE_LINE in "${SERVICES[@]}"; do
         IS_NEW_ALLOCATION="false"
         PROXMOX_VOLID=""
 
-        if [ "$V_TYPE" == "bind" ]; then
-            # Bind Mount
-            echo "Attaching bind mount: $V_SOURCE -> $V_TARGET"
-            MOUNT_STR="$V_SOURCE,mp=$V_TARGET"
-            PROXMOX_VOLID="$V_SOURCE" # For metadata
+        # Global Volume
+        # 1. Check Existing (Update Mode from Metadata)
+        if [ "$UPDATE_MODE" = "true" ] && [ -n "${EXISTING_VOL_MAP[$V_SOURCE]}" ]; then
+                PROXMOX_VOLID="${EXISTING_VOL_MAP[$V_SOURCE]}"
+                echo "Reusing existing volume '$V_SOURCE': $PROXMOX_VOLID"
+                GLOBAL_VOL_MAP[$V_SOURCE]="$PROXMOX_VOLID"
+                MOUNT_STR="$PROXMOX_VOLID,mp=$V_TARGET"
+        
+        # 2. Check Global Map (Current Session Shared)
+        elif [[ -n "${GLOBAL_VOL_MAP[$V_SOURCE]}" ]]; then
+                PROXMOX_VOLID="${GLOBAL_VOL_MAP[$V_SOURCE]}"
+                echo "Attaching shared volume '$V_SOURCE': $PROXMOX_VOLID"
+                MOUNT_STR="$PROXMOX_VOLID,mp=$V_TARGET"
+        
+        # 3. Create New (pct set storage:size)
         else
-            # Global Volume
-            # 1. Check Existing (Update Mode from Metadata)
-            if [ "$UPDATE_MODE" = "true" ] && [ -n "${EXISTING_VOL_MAP[$V_SOURCE]}" ]; then
-                 PROXMOX_VOLID="${EXISTING_VOL_MAP[$V_SOURCE]}"
-                 echo "Reusing existing volume '$V_SOURCE': $PROXMOX_VOLID"
-                 GLOBAL_VOL_MAP[$V_SOURCE]="$PROXMOX_VOLID"
-                 MOUNT_STR="$PROXMOX_VOLID,mp=$V_TARGET"
-            
-            # 2. Check Global Map (Current Session Shared)
-            elif [[ -n "${GLOBAL_VOL_MAP[$V_SOURCE]}" ]]; then
-                 PROXMOX_VOLID="${GLOBAL_VOL_MAP[$V_SOURCE]}"
-                 echo "Attaching shared volume '$V_SOURCE': $PROXMOX_VOLID"
-                 MOUNT_STR="$PROXMOX_VOLID,mp=$V_TARGET"
-            
-            # 3. Create New (pct set storage:size)
-            else
-                 echo "Creating new volume for '$V_SOURCE'..."
-                 # Syntax: storage:size (size in GB, numeric only)
-                 MOUNT_STR="$VOL_STORAGE:$CLEAN_VOL_SIZE,mp=$V_TARGET"
-                 IS_NEW_ALLOCATION="true"
-            fi
+                echo "Creating new volume for '$V_SOURCE'..."
+                # Syntax: storage:size (size in GB, numeric only)
+                MOUNT_STR="$VOL_STORAGE:$CLEAN_VOL_SIZE,mp=$V_TARGET"
+                IS_NEW_ALLOCATION="true"
         fi
         
         # Execute pct set
