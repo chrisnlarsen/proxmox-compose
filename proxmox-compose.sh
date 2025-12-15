@@ -518,13 +518,18 @@ for SERVICE_LINE in "${SERVICES[@]}"; do
     fi
 
     # --- 2. Pull Image ---
-    echo "Pulling image '$S_IMAGE' to $TEMPLATE_STORAGE on $TARGET_NODE..."
-    PULL_OUTPUT=$(pvesh create /nodes/$TARGET_NODE/storage/$TEMPLATE_STORAGE/oci-registry-pull --reference "$S_IMAGE" 2>&1 || true)
+    # Generate deterministic filename for the template
+    # Replace non-alphanumeric chars with underscore, add .tar extension
+    CLEAN_IMAGE_NAME=$(echo "$S_IMAGE" | tr -c 'a-zA-Z0-9.-' '_')
+    TARGET_FILENAME="pmxc_${CLEAN_IMAGE_NAME}.tar"
+    
+    echo "Pulling image '$S_IMAGE' to $TEMPLATE_STORAGE on $TARGET_NODE as '$TARGET_FILENAME'..."
+    PULL_OUTPUT=$(pvesh create /nodes/$TARGET_NODE/storage/$TEMPLATE_STORAGE/oci-registry-pull --reference "$S_IMAGE" --filename "$TARGET_FILENAME" 2>&1 || true)
     UPID=$(echo "$PULL_OUTPUT" | grep -o "UPID:.*" | tail -n 1)
     
     if [ -z "$UPID" ]; then
         if echo "$PULL_OUTPUT" | grep -q "refusing to override"; then
-             echo "Image '$S_IMAGE' already exists. Skipping pull."
+             echo "Image '$S_IMAGE' already exists as '$TARGET_FILENAME'. Skipping pull."
         else
             echo "Error: Could not retrieve UPID from pull command."
             echo "$PULL_OUTPUT"
@@ -550,29 +555,9 @@ for SERVICE_LINE in "${SERVICES[@]}"; do
     fi
 
     # --- 3. Locate Template ---
-    echo "Locating template..."
-    TEMPLATE_VOLID=$(pvesh get /nodes/$TARGET_NODE/storage/$TEMPLATE_STORAGE/content --content vztmpl --output-format json | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-target_image = \"$S_IMAGE\"
-found = None
-# clean target: nginx:latest -> nginx_latest
-clean_target = target_image.replace(':', '_')
-for item in data:
-    volid = item.get('volid')
-    # Check for direct match or cleaned match
-    if target_image in volid or clean_target in volid:
-         found = volid
-         break
-print(found if found else '')
-")
-    
-    if [ -z "$TEMPLATE_VOLID" ]; then
-        echo "Error: Could not locate template for $S_IMAGE even after pull."
-        # Fallback to direct path guessing if needed, or just fail
-        exit 1
-    fi
-    echo "Found template: $TEMPLATE_VOLID"
+    # With explicit filename, we construct the ID directly
+    TEMPLATE_VOLID="$TEMPLATE_STORAGE:vztmpl/$TARGET_FILENAME"
+    echo "Using template: $TEMPLATE_VOLID"
 
     # --- 4. Create Container (RootFS Only) ---
     echo "Creating container $CURRENT_VMID..."
