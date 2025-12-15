@@ -150,7 +150,13 @@ _ingest_project() {
     read -p "Enter Compose File Path or URL [docker-compose.yml]: " INPUT_SOURCE
     INPUT_SOURCE=${INPUT_SOURCE:-docker-compose.yml}
     
-    local tmp_compose="$TMP_DIR/docker-compose.yml"
+    # Detect extension to preserve (yml, yaml, json)
+    # Default to .yml
+    EXT="yml"
+    if [[ "$INPUT_SOURCE" =~ \.yaml$ ]]; then EXT="yaml"; fi
+    if [[ "$INPUT_SOURCE" =~ \.json$ ]]; then EXT="json"; fi
+
+    local tmp_compose="$TMP_DIR/docker-compose.$EXT"
     
     # 1. Fetch File
     if [[ "$INPUT_SOURCE" =~ ^https?:// ]]; then
@@ -199,7 +205,7 @@ except:
         mkdir -p "$PROJECT_DIR"
     fi
     
-    COMPOSE_FILE="$PROJECT_DIR/docker-compose.yml"
+    COMPOSE_FILE="$PROJECT_DIR/docker-compose.$EXT"
     cp "$tmp_compose" "$COMPOSE_FILE"
     
     # 3b. Interactive Edit
