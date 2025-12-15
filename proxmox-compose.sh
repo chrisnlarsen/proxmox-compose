@@ -38,11 +38,11 @@ import sys
 import json
 
 try:
-    with open("docker-compose.yml", "r") as f:
+    with open(sys.argv[1], "r") as f:
         data = yaml.safe_load(f)
 
     if not data or "services" not in data:
-        print("Error: No services found in docker-compose.yml", file=sys.stderr)
+        print("Error: No services found in compose file", file=sys.stderr)
         sys.exit(1)
 
     for name, service in data["services"].items():
@@ -97,7 +97,7 @@ try:
 except Exception as e:
     print(f"Error parsing yaml: {e}", file=sys.stderr)
     sys.exit(1)
-'
+' "$COMPOSE_FILE"
 }
 
 # --- Utils ---
