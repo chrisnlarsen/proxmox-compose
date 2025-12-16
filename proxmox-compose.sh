@@ -14,19 +14,81 @@ fi
 
 PROJECT_BASE_DIR="/var/lib/proxmox-compose"
 # Temp dir for initial download
-TMP_DIR=$(mktemp -d)
-trap 'rm -rf "$TMP_DIR"' EXIT
-
-COMPOSE_FILE=""
-PROJECT_NAME=""
 PROJECT_DIR=""
 METADATA_FILE=""
+created_vmids=()
+
+# Error handling and rollback
+cleanup_on_error() {
+    local exit_code=$?
+    # Only run rollback if we have created VMs and exit was not clean
+    if [ $exit_code -ne 0 ] && [ ${#created_vmids[@]} -gt 0 ]; then
+        echo ""
+        tui_msg "Installation Failed!"
+        if tui_yesno "Installation failed. Rollback/Cleanup created containers (${created_vmids[*]})?"; then
+            echo "Rolling back..."
+            for vmid in "${created_vmids[@]}"; do
+                echo "Destroying incomplete container $vmid..."
+                pct stop $vmid 2>/dev/null || true
+                pct destroy $vmid --purge 2>/dev/null || true
+            done
+            tui_msg "Rollback complete."
+        else
+            echo "Skipping rollback."
+        fi
+    fi
+    rm -rf "$TMP_DIR"
+}
+trap 'cleanup_on_error' EXIT
 
 # Ensure base dir exists
 mkdir -p "$PROJECT_BASE_DIR"
 
 echo "Proxmox OCI Composer"
 echo "===================="
+
+# --- Dependencies & TUI Helpers ---
+
+check_dependencies() {
+    local deps=("whiptail" "python3" "curl" "pct" "pvesh" "pvesm")
+    for cmd in "${deps[@]}"; do
+        if ! command -v "$cmd" &> /dev/null; then
+            echo "Error: Required dependency '$cmd' is missing."
+            exit 1
+        fi
+    done
+}
+
+# TUI Wrappers
+tui_msg() {
+    whiptail --title "Proxmox Compose" --msgbox "$1" 10 60
+}
+
+tui_yesno() {
+    if whiptail --title "Proxmox Compose" --yesno "$1" 10 60; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+tui_input() {
+    # $1=prompt, $2=default, $3=variable_name
+    local val
+    val=$(whiptail --title "Proxmox Compose" --inputbox "$1" 10 60 "$2" 3>&1 1>&2 2>&3)
+    eval "$3=\"$val\""
+    # Return 1 if cancelled (empty val usually, but exit code matters)
+    if [ $? -ne 0 ]; then return 1; fi
+}
+
+tui_menu() {
+    # $1=text, $2=height, $3=width, $4=menu-height, $5+ = options
+    # Output to stdout (capture it)
+    whiptail --title "Proxmox Compose" --menu "$1" "$2" "$3" "$4" "${@:5}" 3>&1 1>&2 2>&3
+}
+
+check_dependencies
+
 
 # --- Embedded Python Parser ---
 # Parses docker-compose.yml and outputs a JSON-like structure
@@ -134,10 +196,14 @@ _detect_bridges() {
     # Build bridge menu
     BRIDGE_MENU_OPTIONS=()
     if [[ -n "$BRIDGES" ]]; then
-      while IFS= read -r bridge; do
-        if [[ -n "$bridge" ]]; then
-          local description=$(grep -A 10 "iface $bridge" /etc/network/interfaces 2>/dev/null | grep '^#' | head -n1 | sed 's/^#\s*//')
-          BRIDGE_MENU_OPTIONS+=("$bridge" "${description:- }")
+      while read -r line; do
+        if [[ $line =~ ^(vmbr[0-9]+)\ +(.*) ]]; then
+          bridge="${BASH_REMATCH[1]}"
+          description="${BASH_REMATCH[2]}"
+          # Append as separate elements: Tag Item
+          BRIDGE_MENU_OPTIONS+=("$bridge" "${description:-Active}")
+        elif [[ $line =~ ^(vmbr[0-9]+)$ ]]; then
+           BRIDGE_MENU_OPTIONS+=("${BASH_REMATCH[1]}" "Active")
         fi
       done <<<"$BRIDGES"
     fi
@@ -146,8 +212,8 @@ _detect_bridges() {
 # Ingest Project function
 # Handles URL/File input, determining project name, and setting up directory
 _ingest_project() {
-    echo "--- Project Setup ---"
-    read -p "Enter Compose File Path or URL [docker-compose.yml]: " INPUT_SOURCE
+    # echo "--- Project Setup ---"
+    if ! tui_input "Enter Compose File Path or URL:" "docker-compose.yml" INPUT_SOURCE; then return; fi
     INPUT_SOURCE=${INPUT_SOURCE:-docker-compose.yml}
     
     # Detect extension to preserve (yml, yaml, json)
@@ -160,14 +226,14 @@ _ingest_project() {
     
     # 1. Fetch File
     if [[ "$INPUT_SOURCE" =~ ^https?:// ]]; then
-        echo "Downloading from URL..."
+        # echo "Downloading from URL..."
         if ! curl -L -o "$tmp_compose" "$INPUT_SOURCE"; then
-            echo "Error: Failed to download file."
+            tui_msg "Error: Failed to download file."
             exit 1
         fi
     else
         if [ ! -f "$INPUT_SOURCE" ]; then
-             echo "Error: File $INPUT_SOURCE not found."
+             tui_msg "Error: File $INPUT_SOURCE not found."
              exit 1
         fi
         cp "$INPUT_SOURCE" "$tmp_compose"
@@ -186,9 +252,8 @@ except:
 ')
     
     if [ -z "$PROJECT_NAME" ]; then
-        echo "Project name not found in compose file (missing 'name:' field)."
-        read -p "Enter Project Name: " PROJECT_NAME
-        if [ -z "$PROJECT_NAME" ]; then echo "Error: Name required."; exit 1; fi
+        if ! tui_input "Project Name (not found in compose):" "" PROJECT_NAME; then exit 1; fi
+        if [ -z "$PROJECT_NAME" ]; then tui_msg "Error: Name required."; exit 1; fi
     fi
     
     # Sanitize name
@@ -197,9 +262,7 @@ except:
     # 3. Setup Directory
     PROJECT_DIR="$PROJECT_BASE_DIR/$PROJECT_NAME"
     if [ -d "$PROJECT_DIR" ]; then
-        echo "Project '$PROJECT_NAME' already exists at $PROJECT_DIR."
-        read -p "Update/Reinstall? (y/n) " UPDATE_OPT
-        if [ "$UPDATE_OPT" != "y" ]; then exit 1; fi
+        if ! tui_yesno "Project '$PROJECT_NAME' already exists. Update/Reinstall?"; then exit 1; fi
         # For now, we just overwrite the compose file. Future: Handle full update flow.
     else
         mkdir -p "$PROJECT_DIR"
@@ -210,11 +273,9 @@ except:
     
     # 3b. Interactive Edit
     if [ -t 0 ]; then
-        echo "Opening compose file for review/edit..."
-        read -p "Press Enter to open nano..."
-        nano "$COMPOSE_FILE"
-    else
-        echo "Non-interactive mode detected. Skipping edit."
+        if tui_yesno "Open compose file for review/edit?"; then
+            nano "$COMPOSE_FILE"
+        fi
     fi
     
     # 4. Init Metadata
@@ -235,7 +296,7 @@ with open("'$METADATA_FILE'", "w") as f:
 '
     fi
     
-    echo "Project '$PROJECT_NAME' staged at $PROJECT_DIR"
+    # echo "Project '$PROJECT_NAME' staged at $PROJECT_DIR"
 }
 
 _save_project_config() {
@@ -323,6 +384,7 @@ with open(meta_path, "w") as f:
 # --- Core Logic ---
 
 install_project() {
+    created_vmids=()
     # 1. Project Ingestion
     _ingest_project
     # COMPOSE_FILE and PROJECT_NAME are now set. METADATA_FILE is set.
@@ -376,102 +438,103 @@ EOF
     
     # Node Selection
     if [ -z "$TARGET_NODE" ]; then
-        echo "Available Nodes:"
-        nodes=$(pvesh get /nodes --output-format json | python3 -c 'import sys, json; print("\n".join([n["node"] for n in json.load(sys.stdin)]))')
-        echo "$nodes"
-        read -p "Target Node: " TARGET_NODE
+        mapfile -t NODES < <(pvesh get /nodes --output-format json | python3 -c 'import sys, json; print("\n".join([n["node"] for n in json.load(sys.stdin)]))')
+        if [ ${#NODES[@]} -eq 1 ]; then
+            TARGET_NODE="${NODES[0]}"
+            tui_msg "Auto-selected only node: $TARGET_NODE"
+        else
+            # Build menu options: Node Node
+            OPTS=()
+            for n in "${NODES[@]}"; do OPTS+=("$n" "$n"); done
+            TARGET_NODE=$(tui_menu "Select Target Node" 15 60 4 "${OPTS[@]}")
+            if [ -z "$TARGET_NODE" ]; then return; fi
+        fi
     else
         echo "Using Configured Node: $TARGET_NODE"
     fi
 
     # Template Storage
     if [ -z "$TEMPLATE_STORAGE" ]; then
-        echo "Available Storages on $TARGET_NODE (supporting vztmpl):"
-        pvesh get /nodes/$TARGET_NODE/storage --output-format json | python3 -c '
+        mapfile -t STORAGES < <(pvesh get /nodes/$TARGET_NODE/storage --output-format json | python3 -c '
 import sys, json
 data = json.load(sys.stdin)
 for s in data:
     if "vztmpl" in s.get("content", ""):
         print(s["storage"])
-'
-        read -p "Target Template Storage ID: " TEMPLATE_STORAGE
+')
+        if [ ${#STORAGES[@]} -eq 1 ]; then
+             TEMPLATE_STORAGE="${STORAGES[0]}"
+             tui_msg "Auto-selected template storage: $TEMPLATE_STORAGE"
+        else
+             OPTS=()
+             for s in "${STORAGES[@]}"; do OPTS+=("$s" "$s"); done
+             TEMPLATE_STORAGE=$(tui_menu "Select Template Storage (vztmpl)" 15 60 4 "${OPTS[@]}")
+             if [ -z "$TEMPLATE_STORAGE" ]; then return; fi
+        fi
     else
         echo "Using Configured Template Storage: $TEMPLATE_STORAGE"
     fi
 
     # RootFS Storage Selection
     if [ -z "$ROOTFS_STORAGE" ]; then
-        echo "Available Storages for Containers (rootdir):"
-        pvesh get /nodes/$TARGET_NODE/storage --output-format json | python3 -c '
+        mapfile -t STORAGES < <(pvesh get /nodes/$TARGET_NODE/storage --output-format json | python3 -c '
 import sys, json
 data = json.load(sys.stdin)
 for s in data:
     if "rootdir" in s.get("content", ""):
         print(s["storage"])
-'
-        read -p "Target Container Storage ID: " ROOTFS_STORAGE
+')
+        if [ ${#STORAGES[@]} -eq 1 ]; then
+             ROOTFS_STORAGE="${STORAGES[0]}"
+             tui_msg "Auto-selected container storage: $ROOTFS_STORAGE"
+        else
+             OPTS=()
+             for s in "${STORAGES[@]}"; do OPTS+=("$s" "$s"); done
+             ROOTFS_STORAGE=$(tui_menu "Select Container Storage (rootdir)" 15 60 4 "${OPTS[@]}")
+             if [ -z "$ROOTFS_STORAGE" ]; then return; fi
+        fi
     else
         echo "Using Configured Container Storage: $ROOTFS_STORAGE"
     fi
 
     # Volume Storage (Virtual Disks)
     if [ -z "$VOL_STORAGE" ]; then
-        read -p "Target Volume Storage ID (Content 'images' or 'rootdir') [$ROOTFS_STORAGE]: " VOL_STORAGE
+        if ! tui_input "Target Volume Storage ID (Content 'images' or 'rootdir'):" "$ROOTFS_STORAGE" VOL_STORAGE; then return; fi
         VOL_STORAGE=${VOL_STORAGE:-$ROOTFS_STORAGE}
     fi
 
     # Volume Size
     if [ -z "$VOL_SIZE" ]; then
-        echo "Default Volume Size (e.g. 8G, 16G)."
-        echo "Note: If using thin provisioning (LVM-Thin/ZFS), it is safe to oversize."
-        read -p "Volume Size [16G]: " VOL_SIZE
+        if ! tui_input "Volume Size (numeric+unit, e.g. 16G):" "16G" VOL_SIZE; then return; fi
         VOL_SIZE=${VOL_SIZE:-16G}
     fi
 
     # Network Bridge
     if [ -z "$NET_BRIDGE" ]; then
-        echo "Detecting Bridges..."
         _detect_bridges
-
-echo "Available Bridges:"
-if [ ${#BRIDGE_MENU_OPTIONS[@]} -eq 0 ]; then
-    echo "No bridges detected via advanced method. Falling back to brctl/ip..."
-    if command -v brctl >/dev/null; then
-        brctl show | awk 'NR>1 {print $1}'
-    else
-         ip link show type bridge | awk -F': ' '{print $2}'
-    fi
-    read -p "Network Bridge (e.g., vmbr0): " NET_BRIDGE
-else
-    # Simple menu selection
-    i=0
-    for ((j=0; j<${#BRIDGE_MENU_OPTIONS[@]}; j+=2)); do
-        echo "$((i+1)). ${BRIDGE_MENU_OPTIONS[j]} - ${BRIDGE_MENU_OPTIONS[j+1]}"
-        ((i+=1))
-    done
-    read -p "Select Bridge [1]: " BRIDGE_SEL
-    BRIDGE_SEL=${BRIDGE_SEL:-1}
-    INDEX=$(( (BRIDGE_SEL - 1) * 2 ))
-    NET_BRIDGE="${BRIDGE_MENU_OPTIONS[INDEX]}"
-        if [ -z "$NET_BRIDGE" ]; then
-            echo "Invalid selection, defaulting to vmbr0"
-            NET_BRIDGE="vmbr0"
+        if [ ${#BRIDGE_MENU_OPTIONS[@]} -eq 2 ]; then
+            # Format is (Tag Item), so 2 elements = 1 option
+            NET_BRIDGE="${BRIDGE_MENU_OPTIONS[0]}"
+            tui_msg "Auto-selected only bridge: $NET_BRIDGE"
+        elif [ ${#BRIDGE_MENU_OPTIONS[@]} -gt 0 ]; then
+             NET_BRIDGE=$(tui_menu "Select Network Bridge" 15 60 4 "${BRIDGE_MENU_OPTIONS[@]}")
+             if [ -z "$NET_BRIDGE" ]; then return; fi
         else
-            echo "Selected: $NET_BRIDGE"
+            if ! tui_input "No bridges detected. Enter bridge name:" "vmbr0" NET_BRIDGE; then return; fi
         fi
-    fi
+        NET_BRIDGE=${NET_BRIDGE:-vmbr0}
     else
-         echo "Using Configured Bridge: $NET_BRIDGE"
+        echo "Using Configured Bridge: $NET_BRIDGE"
     fi
 
     # Network Configuration (DHCP vs Static)
     if [ -z "$IP_CONFIG" ]; then
-        read -p "IP Configuration (dhcp/static) [dhcp]: " IP_CONFIG
-        IP_CONFIG=${IP_CONFIG:-dhcp}
+         IP_CONFIG=$(tui_menu "IP Configuration" 10 60 2 "dhcp" "Auto (DHCP)" "static" "Static IP")
+         if [ -z "$IP_CONFIG" ]; then return; fi
         
         if [ "$IP_CONFIG" = "static" ]; then
-            read -p "IPv4/CIDR (e.g. 192.168.1.10/24): " NET_CIDR
-            read -p "Gateway (e.g. 192.168.1.1): " NET_GW
+            if ! tui_input "IPv4/CIDR (e.g. 192.168.1.10/24):" "" NET_CIDR; then return; fi
+            if ! tui_input "Gateway (e.g. 192.168.1.1):" "" NET_GW; then return; fi
         fi
     fi
     
@@ -485,9 +548,9 @@ else
     _save_project_config
 
     # Starting VMID
-DEFAULT_VMID=$(get_next_vmid)
-read -p "Starting VMID [$DEFAULT_VMID]: " START_VMID
-START_VMID=${START_VMID:-$DEFAULT_VMID}
+    DEFAULT_VMID=$(get_next_vmid)
+    if ! tui_input "Starting VMID:" "$DEFAULT_VMID" START_VMID; then return; fi
+    START_VMID=${START_VMID:-$DEFAULT_VMID}
 
 # Global Volume Tracking
 declare -A GLOBAL_VOL_MAP
@@ -584,6 +647,8 @@ for SERVICE_LINE in "${SERVICES[@]}"; do
         --features nesting=1 \
         --unprivileged 1 \
         --start 0 || { echo "Error: Failed to create container $CURRENT_VMID"; exit 1; }
+    
+    VMID_FOR_TRACKING=$CURRENT_VMID
 
     # --- 5. Post-Creation Volume Attachment (pct set) ---
     echo "Processing volumes..."
@@ -672,6 +737,7 @@ print(json.dumps(services))
 ")
 
     CURRENT_VMID=$((CURRENT_VMID + 1))
+    created_vmids+=("$VMID_FOR_TRACKING")
 done
 
     # Finalize Metadata
@@ -682,68 +748,55 @@ done
 }
 
 manage_projects() {
-    echo "--- Installed Projects ---"
-    if [ ! -d "$PROJECT_BASE_DIR" ] || [ -z "$(ls -A $PROJECT_BASE_DIR)" ]; then
-        echo "No projects found."
+    # List projects in base dir
+    PROJECTS=($(ls -d "$PROJECT_BASE_DIR"/*/ 2>/dev/null | xargs -n 1 basename))
+    
+    if [ ${#PROJECTS[@]} -eq 0 ]; then
+        tui_msg "No projects found."
         return
     fi
-
-    # List directories
-    local projects=($(ls -F "$PROJECT_BASE_DIR" | grep '/$' | tr -d '/'))
     
-    for i in "${!projects[@]}"; do
-        echo "$((i+1)). ${projects[$i]}"
+    # Build Menu
+    local i=1
+    OPTS=()
+    for p in "${PROJECTS[@]}"; do
+        OPTS+=("$p" "Project")
     done
     
-    echo ""
-    read -p "Select Project (or Enter to back): " P_SEL
-    if [ -z "$P_SEL" ]; then return; fi
+    selected_project=$(tui_menu "Select Project" 15 60 6 "${OPTS[@]}")
+    if [ -z "$selected_project" ]; then return; fi
     
-    if ! [[ "$P_SEL" =~ ^[0-9]+$ ]] || [ "$P_SEL" -lt 1 ] || [ "$P_SEL" -gt "${#projects[@]}" ]; then
-        echo "Invalid selection."
-        return
-    fi
+    local p_name="$selected_project"
+    local p_dir="$PROJECT_BASE_DIR/$p_name"
+    local meta_path="$p_dir/metadata.json"
     
-    local selected_project="${projects[$((P_SEL-1))]}"
-    local meta_path="$PROJECT_BASE_DIR/$selected_project/metadata.json"
-    
-    echo ""
-    echo "--- Project: $selected_project ---"
-    if [ -f "$meta_path" ]; then
-        # Pretty print details using python
-        python3 -c '
+    # Get details via python for display in msgbox
+    DETAILS=$(python3 -c '
 import sys, json
 try:
     with open("'$meta_path'", "r") as f:
         data = json.load(f)
         src = data.get("source", "N/A")
         inst = data.get("install_date", "N/A")
-        print(f"Source: {src}")
-        print(f"Installed: {inst}")
-        print("Services:")
+        print(f"Source: {src}\nInstalled: {inst}\n\nServices:")
         for s in data.get("services", []):
-            name = s.get("name", "unknown")
-            vmid = s.get("vmid", "unknown")
-            print(f"  - {name} (VMID: {vmid})")
-except Exception as e:
-    print(f"Error reading metadata: {e}")
-'
-        # Check basic status of VMs? 
-        # For now, just show listing.
-    else
-        echo "No metadata found."
-    fi
-    
-    echo ""
-    echo "Options:"
-    echo "1. Update Project"
-    echo "2. Delete (Not Implemented)"
-    echo "3. Back"
-    read -p "Select: " OPT
-    
-    case $OPT in
+             print(f"- {s.get("name", "?")} (VMID: {s.get("vmid", "?")})")
+except:
+    print("Error reading metadata")
+')
+
+    # Sub-menu for Project
+    ACTION=$(whiptail --title "Project: $p_name" --menu "$DETAILS" 20 70 4 \
+        "1" "Update Project" \
+        "2" "Delete Project" \
+        "3" "Back" 3>&1 1>&2 2>&3)
+        
+    case $ACTION in
         1)
             update_project "$selected_project"
+            ;;
+        2)
+            delete_project "$selected_project"
             ;;
     esac
 }
@@ -841,7 +894,59 @@ with open("'$METADATA_FILE'", "r") as f:
     
     # Clean up
     unset UPDATE_MODE
-    read -p "Update complete. Press Enter..."
+    tui_msg "Update complete."
+}
+
+delete_project() {
+    local p_name="$1"
+    local p_dir="$PROJECT_BASE_DIR/$p_name"
+    METADATA_FILE="$p_dir/metadata.json"
+    
+    if ! tui_yesno "WARNING: This will destroy all containers for project '$p_name'. Continue?"; then return; fi
+    
+    # Check about volumes
+    local KEEP_DATA="true"
+    if tui_yesno "Do you want to DELETE persistent volumes (DATA LOSS)?\n\nSelect YES to DELETE data.\nSelect NO to KEEP data (detach only)."; then
+        KEEP_DATA="false"
+    fi
+    
+    echo "Processing deletion for $p_name..."
+    
+    # Load VMIDs
+    mapfile -t VMID_LIST < <(python3 -c '
+import json
+try:
+    with open("'$METADATA_FILE'", "r") as f:
+        data = json.load(f)
+    for s in data.get("services", []):
+        print(s.get("vmid"))
+except:
+    pass
+')
+    
+    for vmid in "${VMID_LIST[@]}"; do
+        if [ -n "$vmid" ]; then
+            echo "Stopping container $vmid..."
+            pct stop $vmid || true
+            
+            if [ "$KEEP_DATA" = "true" ]; then
+                echo "Detaching volumes from $vmid (Preserving Data)..."
+                # Detach mp0-mp9
+                IDS=""
+                for i in {0..9}; do IDS="$IDS --delete mp$i"; done
+                pct set $vmid $IDS 2>/dev/null || true
+            fi
+            
+            echo "Destroying container $vmid..."
+            pct destroy $vmid --purge || echo "Warning: Failed to destroy $vmid"
+        fi
+    done
+    
+    # Remove Project Directory
+    echo "Removing project files..."
+    rm -rf "$p_dir"
+    
+    tui_msg "Project '$p_name' deleted."
 }
 
 main_menu() {
@@ -849,29 +954,24 @@ main_menu() {
         clear 2>/dev/null || echo ""
         echo "========================================"
         echo "   Proxmox Compose Manager (v0.2)       "
-        echo "========================================"
-        echo "1. Install New Project"
-        echo "2. Manage Projects"
-        echo "3. Exit"
-        echo ""
-        read -p "Select Option: " CHOICE
+        CHOICE=$(whiptail --title "Proxmox OCI Composer" --menu "Main Menu" 15 60 4 \
+            "1" "Install New Project" \
+            "2" "Manage Projects" \
+            "3" "Exit" 3>&1 1>&2 2>&3)
         
+        EXIT_STATUS=$?
+        if [ $EXIT_STATUS -ne 0 ]; then exit 0; fi
+
         case $CHOICE in
             1) 
                 install_project
-                read -p "Press Enter to return to menu..."
+                tui_msg "Installation process completed."
                 ;;
             2) 
                 manage_projects
-                read -p "Press Enter to return to menu..."
                 ;;
             3) 
-                echo "Exiting."
                 exit 0
-                ;;
-            *) 
-                echo "Invalid option."
-                sleep 1
                 ;;
         esac
     done
