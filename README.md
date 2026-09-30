@@ -87,7 +87,38 @@ An update refuses to start for a container that has **snapshots** (PVE cannot mo
 | `restart` | `onboot` (`no` → off, anything else → on) |
 | `mem_limit`, `cpus`, `deploy.resources.limits` | `memory`, `cores` |
 | `volumes` | Container volumes (see Features) |
-| `x-pmxc: {cores, memory, swap, rootfs_size}` | Proxmox-specific overrides per service (memory in MB, rootfs in GB) |
+| `x-pmxc: {cores, memory, swap, rootfs_size, vmid, ip}` | Proxmox-specific overrides per service (memory in MB, rootfs in GB; `ip` with or without `/prefix`) |
+| `container_name` | Extra name for the service in the project hosts file |
+
+### Networking and service names
+
+Each service gets its own container and address. With static addressing, the first service gets the configured address and each further service the next free one (or its own `x-pmxc.ip`); VMIDs count up the same way (or use `x-pmxc.vmid`). Addresses and VMIDs already used by other guests are refused.
+
+Services reach each other by name like in Docker: the project gets a `hosts` file (`<service>` and `container_name` → address) that is bind-mounted read-only over `/etc/hosts` in every container. This needs static addressing; with DHCP, services can't resolve each other.
+
+### Project settings (`x-pmxc`) and non-interactive installs
+
+A top-level `x-pmxc` block pre-answers the installer's questions, which also allows unattended installs:
+
+```yaml
+x-pmxc:
+  node: pve
+  template_storage: local
+  rootfs_storage: local-zfs
+  volume_storage: local-zfs   # default: rootfs_storage
+  volume_size: 8G             # default: 16G
+  bridge: vmbr1
+  tag: 50                     # VLAN tag (optional)
+  ip: 10.10.50.40/24          # first service, or "dhcp"
+  gateway: 10.10.50.1
+  vmid: 940                   # first VMID (default: next free)
+```
+
+```bash
+./proxmox-compose.sh install ./docker-compose.yml -y
+```
+
+With `-y` nothing is asked: missing required settings are an error, and a failed install removes the containers it created.
 
 A local compose file's `.env` and `env_file` files are copied into the project; for a URL, the installer offers to edit `.env` if variables are missing.
 
@@ -96,7 +127,8 @@ A local compose file's `.env` and `env_file` files are copied into the project; 
 *   **OCI Extraction Errors**: Some images (e.g., `postgres:14-alpine`, some `node` images) fail to extract on Proxmox/LXC due to hardlink handling on ZFS. This presents as `IO error: failed to unpack ... File exists`.
     *   *Workaround*: Try using a different base image (e.g., `debian`) or wait for upstream Proxmox fixes.
 *   **Restart Policies**: Does not currently map `restart` policies to Proxmox startup options.
-*   **Not supported yet**: `depends_on`/`healthcheck` ordering, service-name DNS between services, per-service IPs (all services of a project currently share the configured network settings), and volumes shared between services. `ports` are ignored (each container has its own IP).
+*   **Not supported yet**: `depends_on`/`healthcheck` ordering and volumes shared between services. `ports` are ignored (each container has its own IP).
+*   **Project directory permissions**: the hosts file is bind-mounted into unprivileged containers, so every directory above the project directory must be world-traversable (the default `/var/lib/proxmox-compose` is). The installer checks this.
 *   **Unknown build image**: if a container's original template is no longer on disk, the update can't tell image defaults from customisations. It keeps the entrypoint and init user/cwd as they are, lets the new image set the environment variables it defines, and lists the ones it replaced.
 *   **Deleting a project and keeping data**: PVE deletes every volume a container owns when it is destroyed, so "keep data" leaves the containers stopped (tagged `pmxc-detached`, onboot off) instead of destroying them.
 

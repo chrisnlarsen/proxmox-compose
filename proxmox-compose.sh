@@ -23,6 +23,8 @@ created_vmids=()
 # Set by update_service when volumes are parked on a staging container, so a
 # failure never destroys the only copy of a project's data.
 PARKED_VOLUMES_ON=""
+# Set by the CLI's -y/--yes: no prompts; missing settings are errors.
+ASSUME_YES="false"
 
 # Error handling and rollback
 cleanup_on_error() {
@@ -31,7 +33,7 @@ cleanup_on_error() {
     if [ $exit_code -ne 0 ] && [ ${#created_vmids[@]} -gt 0 ]; then
         echo ""
         tui_msg "Installation Failed!"
-        if tui_yesno "Installation failed. Rollback/Cleanup created containers (${created_vmids[*]})?"; then
+        if [ "$ASSUME_YES" = "true" ] || tui_yesno "Installation failed. Rollback/Cleanup created containers (${created_vmids[*]})?"; then
             echo "Rolling back..."
             for vmid in "${created_vmids[@]}"; do
                 echo "Destroying incomplete container $vmid..."
@@ -73,7 +75,11 @@ check_dependencies() {
 
 # TUI Wrappers
 tui_msg() {
-    whiptail --title "Proxmox Compose" --msgbox "$1" 10 60
+    if [ "$ASSUME_YES" = "true" ] || [ ! -t 0 ]; then
+        echo -e "$1"
+    else
+        whiptail --title "Proxmox Compose" --msgbox "$1" 10 60
+    fi
 }
 
 tui_yesno() {
@@ -307,6 +313,9 @@ for name, service in data["services"].items():
         "memory": (int(mem) if isinstance(mem, int) and mem < 1 << 20 else size_bytes(mem) // (1 << 20)) if mem else None,
         "swap": pmxc.get("swap"),
         "rootfs_size": pmxc.get("rootfs_size"),
+        "ip": pmxc.get("ip"),
+        "vmid": pmxc.get("vmid"),
+        "container_name": service.get("container_name"),
     }
     if pmxc.get("memory") and not isinstance(pmxc["memory"], int):
         opts["memory"] = size_bytes(pmxc["memory"]) // (1 << 20)
@@ -355,10 +364,16 @@ _list_templates() {
 # Pull an OCI image to a *versioned* template file so repeat pulls actually
 # fetch the current image (a fixed filename makes PVE refuse to overwrite it).
 # Sets TEMPLATE_VOLID on success. Returns 1 on failure.
+declare -A PULLED_TEMPLATES
 _pull_image() {
     local image="$1"
     local base="$(_template_prefix "$image")_$(date +%Y%m%d-%H%M%S)"
     TEMPLATE_VOLID=""
+    if [ -n "${PULLED_TEMPLATES[$image]}" ]; then
+        TEMPLATE_VOLID="${PULLED_TEMPLATES[$image]}"
+        echo "Using image '$image' pulled earlier in this run: $TEMPLATE_VOLID"
+        return 0
+    fi
 
     echo "Pulling image '$image' to $TEMPLATE_STORAGE on $TARGET_NODE as '$base.tar'..."
     local out upid status exit_status
@@ -383,6 +398,7 @@ _pull_image() {
     fi
 
     TEMPLATE_VOLID="$TEMPLATE_STORAGE:vztmpl/$base.tar"
+    PULLED_TEMPLATES[$image]="$TEMPLATE_VOLID"
     echo "Image pulled successfully: $TEMPLATE_VOLID"
 }
 
@@ -668,8 +684,12 @@ _detect_bridges() {
 # Handles URL/File input, determining project name, and setting up directory
 _ingest_project() {
     # echo "--- Project Setup ---"
-    if ! tui_input "Enter Compose File Path or URL:" "docker-compose.yml" INPUT_SOURCE; then return; fi
-    INPUT_SOURCE=${INPUT_SOURCE:-docker-compose.yml}
+    if [ -n "$1" ]; then
+        INPUT_SOURCE="$1"
+    else
+        if ! tui_input "Enter Compose File Path or URL:" "docker-compose.yml" INPUT_SOURCE; then return 1; fi
+        INPUT_SOURCE=${INPUT_SOURCE:-docker-compose.yml}
+    fi
     
     # Detect extension to preserve (yml, yaml, json)
     # Default to .yml
@@ -717,8 +737,8 @@ except:
     # 3. Setup Directory
     PROJECT_DIR="$PROJECT_BASE_DIR/$PROJECT_NAME"
     if [ -d "$PROJECT_DIR" ]; then
-        if ! tui_yesno "Project '$PROJECT_NAME' already exists. Update/Reinstall?"; then exit 1; fi
-        # For now, we just overwrite the compose file. Future: Handle full update flow.
+        tui_msg "Error: Project '$PROJECT_NAME' already exists. Use Manage Projects -> Update (or '$0 update $PROJECT_NAME')."
+        exit 1
     else
         mkdir -p "$PROJECT_DIR"
     fi
@@ -753,7 +773,7 @@ EOF2
     fi
     
     # 3b. Interactive Edit
-    if [ -t 0 ]; then
+    if [ -t 0 ] && [ "$ASSUME_YES" != "true" ]; then
         if tui_yesno "Open compose file for review/edit?"; then
             nano "$COMPOSE_FILE"
         fi
@@ -782,7 +802,7 @@ with open("'$METADATA_FILE'", "w") as f:
 
 _save_project_config() {
     # Update config section of metadata
-    python3 - "$METADATA_FILE" "$TARGET_NODE" "$TEMPLATE_STORAGE" "$ROOTFS_STORAGE" "$VOL_STORAGE" "$VOL_SIZE" "$NET_BRIDGE" "$IP_CONFIG" "$NET_CIDR" "$NET_GW" <<'EOF'
+    python3 - "$METADATA_FILE" "$TARGET_NODE" "$TEMPLATE_STORAGE" "$ROOTFS_STORAGE" "$VOL_STORAGE" "$VOL_SIZE" "$NET_BRIDGE" "$IP_CONFIG" "$NET_CIDR" "$NET_GW" "$NET_TAG" <<'EOF'
 import json, sys
 meta_path = sys.argv[1]
 try:
@@ -800,7 +820,8 @@ data["config"] = {
     "bridge": sys.argv[7],
     "ip_config": sys.argv[8],
     "net_cidr": sys.argv[9],
-    "net_gw": sys.argv[10]
+    "net_gw": sys.argv[10],
+    "net_tag": sys.argv[11]
 }
 
 with open(meta_path, "w") as f:
@@ -826,6 +847,7 @@ try:
         print(f'IP_CONFIG="{cfg.get("ip_config", "dhcp")}"')
         print(f'NET_CIDR="{cfg.get("net_cidr", "")}"')
         print(f'NET_GW="{cfg.get("net_gw", "")}"')
+        print(f'NET_TAG="{cfg.get("net_tag", "")}"')
         print("CONFIG_LOADED=true")
     else:
         print("CONFIG_LOADED=false")
@@ -862,14 +884,143 @@ with open(meta_path, "w") as f:
 
 
 
+# Print shell assignments for the project settings in the compose file's
+# top-level `x-pmxc` block (values are taken literally, not interpolated):
+#   node, template_storage, rootfs_storage, volume_storage, volume_size,
+#   bridge, tag, ip ("dhcp" or the first service's CIDR), gateway, vmid
+_project_defaults_shell() {
+    python3 - "$COMPOSE_FILE" <<'EOF'
+import shlex, sys, yaml
+data = yaml.safe_load(open(sys.argv[1])) or {}
+x = data.get("x-pmxc") or {}
+out = {
+    "TARGET_NODE": x.get("node"), "TEMPLATE_STORAGE": x.get("template_storage"),
+    "ROOTFS_STORAGE": x.get("rootfs_storage"), "VOL_STORAGE": x.get("volume_storage"),
+    "VOL_SIZE": x.get("volume_size"), "NET_BRIDGE": x.get("bridge"), "NET_TAG": x.get("tag"),
+    "NET_GW": x.get("gateway"), "START_VMID": x.get("vmid"),
+}
+ip = x.get("ip")
+if ip:
+    if str(ip).lower() == "dhcp":
+        out["IP_CONFIG"] = "dhcp"
+    else:
+        out["IP_CONFIG"], out["NET_CIDR"] = "static", ip
+for k, v in out.items():
+    if v is not None:
+        print(f"{k}={shlex.quote(str(v))}")
+EOF
+}
+
+# In non-interactive mode a setting that would need a prompt is an error.
+_require_setting() {
+    if [ "$ASSUME_YES" = "true" ]; then
+        echo "Error: x-pmxc.$1 must be set in the compose file for a non-interactive install."
+        return 1
+    fi
+}
+
+# Plan a VMID and address for every service in SERVICES.
+# Explicit per-service `x-pmxc: {vmid, ip}` must be free; otherwise VMIDs count
+# up from START_VMID and addresses from NET_CIDR, skipping VMIDs in use.
+# Prints "PLAN<TAB>name<TAB>vmid<TAB>ip/cidr (empty for dhcp)<TAB>alias" or
+# "ERROR<TAB>message".
+_plan_services() {
+    local used_ids used_ips
+    used_ids=$(pvesh get /cluster/resources --type vm --output-format json 2>/dev/null)
+    used_ips=$(grep -h -o -E 'ip=[0-9.]+' /etc/pve/lxc/*.conf /etc/pve/nodes/*/lxc/*.conf 2>/dev/null; \
+               grep -h -o -E 'ip=[0-9.]+' /etc/pve/nodes/*/qemu-server/*.conf 2>/dev/null)
+    printf '%s\n' "${SERVICES[@]}" > "$TMP_DIR/services.tsv"
+    python3 - "$START_VMID" "$IP_CONFIG" "$NET_CIDR" "$used_ids" "$used_ips" "$TMP_DIR/services.tsv" <<'EOF'
+import ipaddress, json, sys
+start, mode, cidr, ids_json, ips_raw, services_file = sys.argv[1:7]
+used_ids = {int(r["vmid"]) for r in json.loads(ids_json or "[]") if "vmid" in r}
+used_ips = {l.split("=", 1)[1] for l in ips_raw.split() if "=" in l}
+
+def err(msg):
+    print(f"ERROR\t{msg}")
+    sys.exit(0)
+
+services = []
+for line in open(services_file).read().splitlines():
+    if not line.strip():
+        continue
+    name, _image, _env, _vols, opts = line.split("\t")
+    services.append((name, json.loads(opts)))
+
+net = None
+if mode == "static":
+    try:
+        first = ipaddress.ip_interface(cidr)
+    except ValueError:
+        err(f"invalid address '{cidr}' (expected e.g. 192.168.1.10/24)")
+    net, next_ip = first.network, first.ip
+
+next_id = int(start)
+planned_ids, planned_ips = set(), set()
+for name, o in services:
+    if o.get("vmid"):
+        vmid = int(o["vmid"])
+        if vmid in used_ids or vmid in planned_ids:
+            err(f"VMID {vmid} requested for service {name} is already in use")
+    else:
+        while next_id in used_ids or next_id in planned_ids:
+            next_id += 1
+        vmid = next_id
+    planned_ids.add(vmid)
+
+    ip = ""
+    if mode == "static":
+        if o.get("ip"):
+            want = str(o["ip"])
+            iface = ipaddress.ip_interface(want if "/" in want else f"{want}/{net.prefixlen}")
+        else:
+            while str(next_ip) in planned_ips:
+                next_ip += 1
+            iface = ipaddress.ip_interface(f"{next_ip}/{net.prefixlen}")
+            next_ip += 1
+        if iface.ip not in iface.network or iface.ip in (iface.network.network_address, iface.network.broadcast_address):
+            err(f"address {iface} for service {name} is not a usable host address")
+        if str(iface.ip) in used_ips or str(iface.ip) in planned_ips:
+            err(f"address {iface.ip} for service {name} is already used by another guest")
+        planned_ips.add(str(iface.ip))
+        ip = str(iface)
+    print(f"PLAN\t{name}\t{vmid}\t{ip}\t{o.get('container_name') or ''}")
+EOF
+}
+
+# Project hosts file: every service (and its container_name) by address.
+_write_hosts_file() {
+    echo "127.0.0.1 localhost"
+    echo "::1 localhost ip6-localhost ip6-loopback"
+    local n
+    for n in "${!SVC_IP[@]}"; do
+        [ -n "${SVC_IP[$n]}" ] || continue
+        echo "${SVC_IP[$n]%/*} $n${SVC_ALIAS[$n]:+ ${SVC_ALIAS[$n]}}"
+    done | sort -V
+}
+
+# net0 address options for a planned service address ("" = DHCP).
+_net_ip_opts() {
+    if [ -n "$1" ]; then
+        echo "ip=$1${NET_GW:+,gw=$NET_GW}"
+    else
+        echo "ip=dhcp"
+    fi
+}
+
 # --- Core Logic ---
 
 install_project() {
     created_vmids=()
+    TARGET_NODE="" TEMPLATE_STORAGE="" ROOTFS_STORAGE="" VOL_STORAGE="" VOL_SIZE=""
+    NET_BRIDGE="" NET_TAG="" IP_CONFIG="" NET_CIDR="" NET_GW="" START_VMID=""
     # 1. Project Ingestion
-    _ingest_project
+    _ingest_project "$1" || return 1
     # COMPOSE_FILE and PROJECT_NAME are now set. METADATA_FILE is set.
     # (Updates of existing projects go through update_project, not here.)
+
+    # Project-level defaults from the compose file's top-level x-pmxc block
+    eval "$(_project_defaults_shell)"
 
     # 2. Inputs for Deployment
     # Logic: If CONFIG_LOADED is true, verify variables, else prompt.
@@ -884,6 +1035,7 @@ install_project() {
             # Build menu options: Node Node
             OPTS=()
             for n in "${NODES[@]}"; do OPTS+=("$n" "$n"); done
+            _require_setting node || return 1
             TARGET_NODE=$(tui_menu "Select Target Node" 15 60 4 "${OPTS[@]}")
             if [ -z "$TARGET_NODE" ]; then return; fi
         fi
@@ -906,6 +1058,7 @@ for s in data:
         else
              OPTS=()
              for s in "${STORAGES[@]}"; do OPTS+=("$s" "$s"); done
+             _require_setting template_storage || return 1
              TEMPLATE_STORAGE=$(tui_menu "Select Template Storage (vztmpl)" 15 60 4 "${OPTS[@]}")
              if [ -z "$TEMPLATE_STORAGE" ]; then return; fi
         fi
@@ -928,6 +1081,7 @@ for s in data:
         else
              OPTS=()
              for s in "${STORAGES[@]}"; do OPTS+=("$s" "$s"); done
+             _require_setting rootfs_storage || return 1
              ROOTFS_STORAGE=$(tui_menu "Select Container Storage (rootdir)" 15 60 4 "${OPTS[@]}")
              if [ -z "$ROOTFS_STORAGE" ]; then return; fi
         fi
@@ -936,6 +1090,8 @@ for s in data:
     fi
 
     # Volume Storage (Virtual Disks)
+    if [ -z "$VOL_STORAGE" ] && [ "$ASSUME_YES" = "true" ]; then VOL_STORAGE="$ROOTFS_STORAGE"; fi
+    if [ -z "$VOL_SIZE" ] && [ "$ASSUME_YES" = "true" ]; then VOL_SIZE="16G"; fi
     if [ -z "$VOL_STORAGE" ]; then
         if ! tui_input "Target Volume Storage ID (Content 'images' or 'rootdir'):" "$ROOTFS_STORAGE" VOL_STORAGE; then return; fi
         VOL_STORAGE=${VOL_STORAGE:-$ROOTFS_STORAGE}
@@ -955,6 +1111,7 @@ for s in data:
             NET_BRIDGE="${BRIDGE_MENU_OPTIONS[0]}"
             tui_msg "Auto-selected only bridge: $NET_BRIDGE"
         elif [ ${#BRIDGE_MENU_OPTIONS[@]} -gt 0 ]; then
+             _require_setting bridge || return 1
              NET_BRIDGE=$(tui_menu "Select Network Bridge" 15 60 4 "${BRIDGE_MENU_OPTIONS[@]}")
              if [ -z "$NET_BRIDGE" ]; then return; fi
         else
@@ -965,30 +1122,36 @@ for s in data:
         echo "Using Configured Bridge: $NET_BRIDGE"
     fi
 
+    # VLAN tag (optional)
+    if [ -z "$NET_TAG" ] && [ "$ASSUME_YES" != "true" ]; then
+        tui_input "VLAN tag (leave empty for none):" "" NET_TAG || return 1
+    fi
+
     # Network Configuration (DHCP vs Static)
     if [ -z "$IP_CONFIG" ]; then
+         _require_setting ip || return 1
          IP_CONFIG=$(tui_menu "IP Configuration" 10 60 2 "dhcp" "Auto (DHCP)" "static" "Static IP")
          if [ -z "$IP_CONFIG" ]; then return; fi
         
         if [ "$IP_CONFIG" = "static" ]; then
-            if ! tui_input "IPv4/CIDR (e.g. 192.168.1.10/24):" "" NET_CIDR; then return; fi
+            if ! tui_input "IPv4/CIDR of the first service (e.g. 192.168.1.10/24).\nFurther services get the following addresses:" "" NET_CIDR; then return; fi
             if ! tui_input "Gateway (e.g. 192.168.1.1):" "" NET_GW; then return; fi
         fi
     fi
     
-    if [ "$IP_CONFIG" = "static" ]; then
-        NET_OPTS="ip=$NET_CIDR,gw=$NET_GW"
-    else
-        NET_OPTS="ip=dhcp"
-    fi
-
     # Save Config
     _save_project_config
 
     # Starting VMID
-    DEFAULT_VMID=$(get_next_vmid)
-    if ! tui_input "Starting VMID:" "$DEFAULT_VMID" START_VMID; then return; fi
-    START_VMID=${START_VMID:-$DEFAULT_VMID}
+    if [ -z "$START_VMID" ]; then
+        DEFAULT_VMID=$(get_next_vmid)
+        if [ "$ASSUME_YES" = "true" ]; then
+            START_VMID="$DEFAULT_VMID"
+        else
+            if ! tui_input "Starting VMID:" "$DEFAULT_VMID" START_VMID; then return; fi
+            START_VMID=${START_VMID:-$DEFAULT_VMID}
+        fi
+    fi
 
 # Global Volume Tracking
 declare -A GLOBAL_VOL_MAP
@@ -1005,7 +1168,37 @@ while ! load_services; do
     fi
 done
 
-CURRENT_VMID=$START_VMID
+# Per-service VMID and address, checked against existing containers
+declare -A SVC_VMID SVC_IP SVC_ALIAS
+local plan_line p_name p_vmid p_ip p_alias
+while IFS=$'\t' read -r plan_line p_name p_vmid p_ip p_alias; do
+    case "$plan_line" in
+        ERROR) tui_msg "Error: $p_name"; return 1 ;;
+        PLAN)
+            SVC_VMID["$p_name"]="$p_vmid"; SVC_IP["$p_name"]="$p_ip"; SVC_ALIAS["$p_name"]="$p_alias"
+            echo "Planned: $p_name -> VMID $p_vmid, ${p_ip:-dhcp}" ;;
+    esac
+done < <(_plan_services)
+if [ ${#SVC_VMID[@]} -ne ${#SERVICES[@]} ]; then
+    tui_msg "Error: Could not plan VMIDs/addresses for all services."
+    return 1
+fi
+
+HOSTS_FILE=""
+if [ "$IP_CONFIG" = "static" ]; then
+    HOSTS_FILE="$PROJECT_DIR/hosts"
+    _write_hosts_file > "$HOSTS_FILE"
+    chmod 644 "$HOSTS_FILE"
+    # Unprivileged containers bind-mount it as a mapped uid: every parent
+    # directory must be traversable by "other", or the container won't start.
+    blocked=$(d="$PROJECT_DIR"; while [ "$d" != "/" ]; do [ "$(( $(stat -c %a "$d") % 10 & 1 ))" -eq 1 ] || echo "$d"; d=$(dirname "$d"); done)
+    if [ -n "$blocked" ]; then
+        tui_msg "Error: $HOSTS_FILE is not reachable by unprivileged containers because these directories are not world-traversable (o+x):\n$blocked\n\nMove the project directory (PMXC_BASE_DIR) or fix the permissions."
+        return 1
+    fi
+elif [ ${#SERVICES[@]} -gt 1 ]; then
+    echo "Note: with DHCP, services can't reach each other by name (no hosts file). Use static addresses for multi-service projects."
+fi
 
 # Metadata collection Array
 METADATA_SERVICES_JSON="[]"
@@ -1016,6 +1209,7 @@ for SERVICE_LINE in "${SERVICES[@]}"; do
     echo ""
     echo "--- Deploying Service: $S_NAME ---"
     echo "Image: $S_IMAGE"
+    CURRENT_VMID="${SVC_VMID[$S_NAME]}"
     echo "Target VMID: $CURRENT_VMID"
     
     # Metadata for this service
@@ -1049,7 +1243,7 @@ for SERVICE_LINE in "${SERVICES[@]}"; do
         --memory "${OPT_MEMORY:-512}" \
         --swap "${OPT_SWAP:-512}" \
         --onboot "${OPT_ONBOOT:-0}" \
-        --net0 "name=eth0,bridge=$NET_BRIDGE,firewall=1,$NET_OPTS" \
+        --net0 "name=eth0,bridge=$NET_BRIDGE,firewall=1${NET_TAG:+,tag=$NET_TAG},$(_net_ip_opts "${SVC_IP[$S_NAME]}")" \
         --rootfs "$ROOTFS_STORAGE:${OPT_ROOTFS_SIZE:-$CLEAN_VOL_SIZE}" \
         --features nesting=1 \
         --unprivileged 1 \
@@ -1106,6 +1300,11 @@ for SERVICE_LINE in "${SERVICES[@]}"; do
         fi
     done
 
+    # Service-name resolution: bind the project hosts file over /etc/hosts
+    if [ -n "$HOSTS_FILE" ]; then
+        echo "lxc.mount.entry: $HOSTS_FILE etc/hosts none bind,ro,create=file 0 0" >> "/etc/pve/lxc/${CURRENT_VMID}.conf"
+    fi
+
     # --- 6. Environment (image defaults + compose) ---
     echo "Setting environment variables..."
     _apply_runtime "$CURRENT_VMID" "" "" "$(_template_path "$TEMPLATE_VOLID")" "$S_ENV_JSON" "$S_OPTS_JSON" | sed -n 's/^\(SET\|WARN\|NOTE\)\t/  /p'
@@ -1125,12 +1324,12 @@ services.append({
     'vmid': $CURRENT_VMID,
     'container_storage': '$ROOTFS_STORAGE',
     'template': '$TEMPLATE_VOLID',
+    'ip': '${SVC_IP[$S_NAME]}',
     'volumes': json.loads('$SERVICE_VOLUMES_LOG')
 })
 print(json.dumps(services))
 ")
 
-    CURRENT_VMID=$((CURRENT_VMID + 1))
     created_vmids+=("$VMID_FOR_TRACKING")
 done
 
@@ -1194,8 +1393,6 @@ except:
             ;;
     esac
 }
-
-ASSUME_YES="false"
 
 # Confirmation / notices that also work non-interactively (CLI with --yes).
 _confirm() {
@@ -1686,6 +1883,7 @@ main_menu() {
 usage() {
     echo "Usage: $0                       Interactive menu"
     echo "       $0 list                  List projects"
+    echo "       $0 install <file|url> [-y] Install a project (-y: no prompts; settings from x-pmxc)"
     echo "       $0 update <project> [-y] Update a project (-y: no prompts, keep local compose file)"
 }
 
@@ -1696,6 +1894,15 @@ case "${1:-}" in
         ;;
     list)
         ls -1 "$PROJECT_BASE_DIR" 2>/dev/null
+        ;;
+    install)
+        if [ -z "${2:-}" ]; then
+            usage
+            exit 1
+        fi
+        [ "${3:-}" = "-y" ] || [ "${3:-}" = "--yes" ] && ASSUME_YES="true"
+        install_project "$2"
+        exit $?
         ;;
     update)
         if [ -z "${2:-}" ] || [ ! -d "$PROJECT_BASE_DIR/$2" ]; then
