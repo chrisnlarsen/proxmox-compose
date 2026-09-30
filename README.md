@@ -74,12 +74,29 @@ An update refuses to start for a container that has **snapshots** (PVE cannot mo
 *   **Environment Variables**: Parses `environment` sections and injects them into the container configuration (`lxc.environment`).
 *   **Container Creation**: Automatically creates unprivileged LXC containers for each service.
 
+## Compose support
+
+| Compose key | Becomes |
+|---|---|
+| `image` | OCI image pulled into a template (`pvesh .../oci-registry-pull`) |
+| `.env`, `${VAR}`, `${VAR:-default}`, `${VAR:?error}`, `${VAR:+alt}`, `$$` | Interpolated everywhere; the shell environment overrides `.env`. A missing required variable stops before anything is changed. |
+| `env_file`, `environment` | The container environment (image defaults + env files + `environment`) |
+| `command`, `entrypoint` | The container `entrypoint` (combined with the image's Entrypoint/Cmd the way Docker does) |
+| `user` | `lxc.init.uid` / `lxc.init.gid` (numeric or `root`) |
+| `shm_size` | A sized tmpfs on `/dev/shm` |
+| `restart` | `onboot` (`no` → off, anything else → on) |
+| `mem_limit`, `cpus`, `deploy.resources.limits` | `memory`, `cores` |
+| `volumes` | Container volumes (see Features) |
+| `x-pmxc: {cores, memory, swap, rootfs_size}` | Proxmox-specific overrides per service (memory in MB, rootfs in GB) |
+
+A local compose file's `.env` and `env_file` files are copied into the project; for a URL, the installer offers to edit `.env` if variables are missing.
+
 ## Limitations & Known Issues
 
 *   **OCI Extraction Errors**: Some images (e.g., `postgres:14-alpine`, some `node` images) fail to extract on Proxmox/LXC due to hardlink handling on ZFS. This presents as `IO error: failed to unpack ... File exists`.
     *   *Workaround*: Try using a different base image (e.g., `debian`) or wait for upstream Proxmox fixes.
 *   **Restart Policies**: Does not currently map `restart` policies to Proxmox startup options.
-*   **Compose support is partial**: only `image`, `environment` and `volumes` are read. `env_file`, `.env`/`${VAR}` interpolation, `command`, `entrypoint` and `depends_on` are not supported yet.
+*   **Not supported yet**: `depends_on`/`healthcheck` ordering, service-name DNS between services, per-service IPs (all services of a project currently share the configured network settings), and volumes shared between services. `ports` are ignored (each container has its own IP).
 *   **Unknown build image**: if a container's original template is no longer on disk, the update can't tell image defaults from customisations. It keeps the entrypoint and init user/cwd as they are, lets the new image set the environment variables it defines, and lists the ones it replaced.
 *   **Deleting a project and keeping data**: PVE deletes every volume a container owns when it is destroyed, so "keep data" leaves the containers stopped (tagged `pmxc-detached`, onboot off) instead of destroying them.
 

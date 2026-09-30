@@ -103,76 +103,231 @@ check_dependencies
 
 
 # --- Embedded Python Parser ---
-# Parses docker-compose.yml and outputs a JSON-like structure
-# Output format per line (tab separated, JSON never contains raw tabs):
-# SERVICE_NAME<TAB>IMAGE<TAB>ENV_VARS_JSON<TAB>VOLUMES_JSON
+# Parses the compose file (with .env / env_file / ${VAR} interpolation) and
+# prints one tab-separated line per service (JSON never contains raw tabs):
+#   NAME  IMAGE  ENV_JSON  VOLUMES_JSON  OPTIONS_JSON
+# OPTIONS_JSON holds runtime settings: command, entrypoint (lists or null),
+# user, shm_size (bytes), onboot, cores, memory, swap (MB), rootfs_size (GB).
+# Exits non-zero (with a message) on a missing required variable.
 parse_compose() {
-    python3 -c '
+    python3 - "$COMPOSE_FILE" <<'EOF'
+import json, math, os, re, shlex, sys
 import yaml
-import sys
-import json
+
+compose_path = sys.argv[1]
+base_dir = os.path.dirname(os.path.abspath(compose_path))
+
+def fail(msg):
+    print(f"Error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+def parse_dotenv(path):
+    """KEY=VALUE lines; supports comments, `export`, single/double quotes."""
+    values = {}
+    with open(path) as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[7:].lstrip()
+            key, sep, val = line.partition("=")
+            key = key.strip()
+            if not sep or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", key):
+                continue
+            val = val.strip()
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in "'\"":
+                quote, val = val[0], val[1:-1]
+                if quote == '"':
+                    val = val.replace('\\"', '"').replace("\\\\", "\\")
+            else:
+                val = re.sub(r"\s+#.*$", "", val)  # inline comment
+            values[key] = val
+    return values
+
+# Interpolation source: .env next to the compose file, overridden by the
+# shell environment (compose precedence).
+dotenv_path = os.path.join(base_dir, ".env")
+interp_env = parse_dotenv(dotenv_path) if os.path.isfile(dotenv_path) else {}
+interp_env.update(os.environ)
+
+def interpolate(s, where):
+    """Compose-spec interpolation: $$, $VAR, ${VAR}, ${VAR:-d}, ${VAR-d},
+    ${VAR:?e}, ${VAR?e}, ${VAR:+a}, ${VAR+a}; defaults may nest."""
+    out, i, n = [], 0, len(s)
+    while i < n:
+        c = s[i]
+        if c != "$":
+            out.append(c); i += 1; continue
+        if i + 1 < n and s[i + 1] == "$":
+            out.append("$"); i += 2; continue
+        if i + 1 < n and s[i + 1] == "{":
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if s[j] == "{" and s[j - 1] == "$":
+                    depth += 1
+                elif s[j] == "}":
+                    depth -= 1
+                j += 1
+            if depth:
+                fail(f"unterminated '${{' in {where}: {s}")
+            expr = s[i + 2:j - 1]
+            m = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)(?:(:?[-?+])(.*))?", expr, re.S)
+            if not m:
+                fail(f"invalid interpolation '${{{expr}}}' in {where}")
+            name, op, arg = m.group(1), m.group(2), m.group(3) or ""
+            val = interp_env.get(name)
+            unset_or_empty = val is None or val == ""
+            if op is None:
+                out.append(val or "")
+            elif op in (":-", "-"):
+                use_default = unset_or_empty if op == ":-" else val is None
+                out.append(interpolate(arg, where) if use_default else val)
+            elif op in (":?", "?"):
+                missing = unset_or_empty if op == ":?" else val is None
+                if missing:
+                    fail(f"required variable {name} is not set ({interpolate(arg, where) or 'no message'}) in {where}. Add it to {dotenv_path}")
+                out.append(val)
+            else:  # :+ / +
+                present = not unset_or_empty if op == ":+" else val is not None
+                out.append(interpolate(arg, where) if present else "")
+            i = j
+            continue
+        m = re.match(r"\$([A-Za-z_][A-Za-z0-9_]*)", s[i:])
+        if m:
+            out.append(interp_env.get(m.group(1), "")); i += len(m.group(0)); continue
+        out.append(c); i += 1
+    return "".join(out)
+
+def walk(node, where):
+    if isinstance(node, str):
+        return interpolate(node, where)
+    if isinstance(node, list):
+        return [walk(x, where) for x in node]
+    if isinstance(node, dict):
+        return {k: walk(v, f"{where}.{k}") for k, v in node.items()}
+    return node
+
+def as_str(v):
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return str(v)
+
+def as_cmd(v):
+    if v is None:
+        return None
+    if isinstance(v, str):
+        return shlex.split(v)
+    return [as_str(x) for x in v]
+
+def size_bytes(v):
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return int(v)
+    m = re.fullmatch(r"\s*([\d.]+)\s*([kmgt]?)i?b?\s*", str(v), re.I)
+    if not m:
+        fail(f"invalid size '{v}'")
+    return int(float(m.group(1)) * 1024 ** "bkmgt".index((m.group(2) or "b").lower()))
 
 try:
-    with open(sys.argv[1], "r") as f:
+    with open(compose_path) as f:
         data = yaml.safe_load(f)
-
-    if not data or "services" not in data:
-        print("Error: No services found in compose file", file=sys.stderr)
-        sys.exit(1)
-
-    for name, service in data["services"].items():
-        image = service.get("image")
-        if not image:
-            print(f"Warning: Service {name} has no image defined. Skipping.", file=sys.stderr)
-            continue
-        
-        # Handle environment variables (list or dict)
-        env = {}
-        raw_env = service.get("environment")
-        if isinstance(raw_env, list):
-            for item in raw_env:
-                if "=" in item:
-                    k, v = item.split("=", 1)
-                    env[k] = v
-                else: 
-                     # Handle "KEY" (pass-through) - simplistic check
-                     pass 
-        if isinstance(raw_env, dict):
-            env = raw_env
-        
-        # Handle volumes
-        volumes = []
-        raw_vols = service.get("volumes", [])
-        for v in raw_vols:
-            # v might be "source:target" or "source:target:mode"
-            # or dict (long syntax)
-            if isinstance(v, str):
-                parts = v.split(":")
-                source = parts[0]
-                target = parts[1] if len(parts) > 1 else source # Fallback
-                
-                # Determine type
-                # If source starts with ./ or / or ~, it is a bind mount (local path) -> We treat as NEW volume
-                # If source is named (alphanumeric), it is a global volume
-                v_type = "bind"
-                if not (source.startswith(".") or source.startswith("/") or source.startswith("~")):
-                    v_type = "global"
-                
-                volumes.append({"type": v_type, "source": source, "target": target})
-            elif isinstance(v, dict):
-                # Long syntax not fully supported yet, best effort
-                source = v.get("source")
-                target = v.get("target")
-                v_type = "bind" if v.get("type") == "bind" else "global"
-                if source and target:
-                     volumes.append({"type": v_type, "source": source, "target": target})
-
-        print(f"{name}\t{image}\t{json.dumps(env)}\t{json.dumps(volumes)}")
-
 except Exception as e:
-    print(f"Error parsing yaml: {e}", file=sys.stderr)
-    sys.exit(1)
-' "$COMPOSE_FILE"
+    fail(f"parsing yaml: {e}")
+if not data or "services" not in data:
+    fail("No services found in compose file")
+
+for name, service in data["services"].items():
+    service = walk(service or {}, f"services.{name}")
+    image = service.get("image")
+    if not image:
+        print(f"Warning: Service {name} has no image defined. Skipping.", file=sys.stderr)
+        continue
+
+    # env_file first, then environment (environment wins)
+    env = {}
+    env_files = service.get("env_file") or []
+    if isinstance(env_files, (str, dict)):
+        env_files = [env_files]
+    for ef in env_files:
+        path, required = (ef.get("path"), ef.get("required", True)) if isinstance(ef, dict) else (ef, True)
+        full = os.path.join(base_dir, path)
+        if os.path.isfile(full):
+            env.update(parse_dotenv(full))
+        elif required:
+            fail(f"env_file '{path}' for service {name} not found (expected at {full})")
+
+    raw_env = service.get("environment") or {}
+    if isinstance(raw_env, list):
+        for item in raw_env:
+            k, sep, v = as_str(item).partition("=")
+            if sep:
+                env[k] = v
+            elif k in interp_env:  # "KEY" alone passes the value through
+                env[k] = interp_env[k]
+    else:
+        for k, v in raw_env.items():
+            if v is None:
+                if k in interp_env:
+                    env[k] = interp_env[k]
+            else:
+                env[k] = as_str(v)
+
+    # Volumes
+    volumes = []
+    for v in service.get("volumes") or []:
+        if isinstance(v, str):
+            parts = v.split(":")
+            source = parts[0]
+            target = parts[1] if len(parts) > 1 else source
+            v_type = "bind" if source.startswith((".", "/", "~")) else "global"
+            volumes.append({"type": v_type, "source": source, "target": target})
+        elif isinstance(v, dict):
+            source, target = v.get("source"), v.get("target")
+            v_type = "bind" if v.get("type") == "bind" else "global"
+            if source and target:
+                volumes.append({"type": v_type, "source": source, "target": target})
+
+    # Runtime options
+    limits = ((service.get("deploy") or {}).get("resources") or {}).get("limits") or {}
+    pmxc = service.get("x-pmxc") or {}
+    mem = pmxc.get("memory") or service.get("mem_limit") or limits.get("memory")
+    cpus = pmxc.get("cores") or service.get("cpus") or limits.get("cpus")
+    restart = as_str(service.get("restart")) if "restart" in service else None
+    opts = {
+        "command": as_cmd(service.get("command")),
+        "entrypoint": as_cmd(service.get("entrypoint")),
+        "user": as_str(service.get("user")) if service.get("user") is not None else None,
+        "shm_size": size_bytes(service.get("shm_size")),
+        "onboot": None if restart is None else (0 if restart == "no" else 1),
+        "cores": max(1, math.ceil(float(cpus))) if cpus else None,
+        "memory": (int(mem) if isinstance(mem, int) and mem < 1 << 20 else size_bytes(mem) // (1 << 20)) if mem else None,
+        "swap": pmxc.get("swap"),
+        "rootfs_size": pmxc.get("rootfs_size"),
+    }
+    if pmxc.get("memory") and not isinstance(pmxc["memory"], int):
+        opts["memory"] = size_bytes(pmxc["memory"]) // (1 << 20)
+
+    for k, v in env.items():
+        if re.search(r"[\x00-\x08\x0a-\x1f\x7f]", v):
+            fail(f"environment variable {k} of service {name} contains control characters (e.g. a newline); PVE cannot store that")
+    print(f"{name}\t{image}\t{json.dumps(env)}\t{json.dumps(volumes)}\t{json.dumps(opts)}")
+EOF
+}
+
+# Fill the SERVICES array from the compose file; returns 1 (after printing
+# the parser's error) if the compose file can't be fully resolved.
+load_services() {
+    local out
+    SERVICES=()
+    if ! out=$(parse_compose); then
+        return 1
+    fi
+    [ -n "$out" ] && mapfile -t SERVICES <<< "$out"
+    return 0
 }
 
 # --- Utils ---
@@ -246,6 +401,18 @@ _prune_templates() {
     done < <(_list_templates "$image")
 }
 
+# Print shell assignments (OPT_CORES, OPT_MEMORY, OPT_SWAP, OPT_ONBOOT,
+# OPT_ROOTFS_SIZE) for the resource options of a service; unset ones are empty.
+_opts_shell() {
+    python3 - "$1" <<'EOF2'
+import json, shlex, sys
+o = json.loads(sys.argv[1] or "{}")
+for key in ("cores", "memory", "swap", "onboot", "rootfs_size"):
+    v = o.get(key)
+    print(f"OPT_{key.upper()}={shlex.quote('' if v is None else str(int(v)))}")
+EOF2
+}
+
 # Filesystem path of a template volid ("" if it doesn't exist).
 _template_path() {
     [ -z "$1" ] && return
@@ -263,8 +430,11 @@ _template_path() {
 # image are customisations and are carried over; everything else follows the
 # new image. Compose environment values always win.
 #
+# Compose `command` / `entrypoint` / `user` / `shm_size` (options JSON from
+# parse_compose) take precedence over both image defaults and kept values.
+#
 # Args: vmid, old config file ("" for a fresh install), old template path
-# ("" if unknown), new template path, compose env JSON.
+# ("" if unknown), new template path, compose env JSON, compose options JSON.
 # The env list is written directly as lxc.environment.runtime lines (the
 # format PVE stores it in); the NUL-separated `env` option can't be passed
 # on a command line.
@@ -273,6 +443,9 @@ _apply_runtime() {
 import json, shlex, sys, tarfile
 
 vmid, old_conf_path, old_tmpl, new_tmpl, compose_env_json = sys.argv[1:6]
+opts = json.loads((sys.argv[6] if len(sys.argv) > 6 else "") or "{}")
+compose_sets_entrypoint = opts.get("command") is not None or opts.get("entrypoint") is not None
+compose_sets_user = opts.get("user") is not None
 conf_path = f"/etc/pve/lxc/{vmid}.conf"
 
 def oci_config(path):
@@ -362,7 +535,7 @@ if old_conf_path:
             customised = (shlex.split(old_entrypoint) if old_entrypoint else None) != default
         except ValueError:
             customised = True
-        if customised and old_entrypoint:
+        if customised and old_entrypoint and not compose_sets_entrypoint:
             set_entrypoint = old_entrypoint
             print(f"KEPT\tcustom entrypoint: {old_entrypoint}")
             new_default = default_entrypoint(new_cfg)
@@ -381,7 +554,8 @@ if old_conf_path:
         for k, v in old_init.items():
             if k in defaults and defaults[k] != v:
                 final_init[k] = v
-                print(f"KEPT\tcustom {k}: {v}")
+                if not (compose_sets_user and k in ("lxc.init.uid", "lxc.init.gid")):
+                    print(f"KEPT\tcustom {k}: {v}")
     else:
         # Old image unknown: can't tell defaults from customisations.
         # Keep the entrypoint and init user/cwd (changing them can break the
@@ -401,10 +575,39 @@ if old_conf_path:
 
 final_env.update({k: "" if v is None else str(v) for k, v in compose_env.items()})
 
+# Compose runtime options
+set_shm = None
+if compose_sets_entrypoint:
+    # Compose semantics: entrypoint replaces the image Entrypoint and drops its
+    # Cmd; command replaces the Cmd.
+    ep = opts["entrypoint"] if opts.get("entrypoint") is not None else (new_cfg.get("Entrypoint") or [])
+    if opts.get("command") is not None:
+        cmd = opts["command"]
+    else:
+        cmd = [] if opts.get("entrypoint") is not None else (new_cfg.get("Cmd") or [])
+    if ep + cmd:
+        set_entrypoint = shlex.join(ep + cmd)
+        print(f"SET\tentrypoint from compose: {set_entrypoint}")
+if opts.get("user") is not None:
+    u, _, g = opts["user"].partition(":")
+    ids = {"root": "0"}
+    u, g = ids.get(u, u), ids.get(g, g)
+    if u.isdigit() and (not g or g.isdigit()):
+        final_init["lxc.init.uid"] = u
+        final_init["lxc.init.gid"] = g or ("0" if u == "0" else final_init.get("lxc.init.gid"))
+        print(f"SET\tuser from compose: {u}{':' + final_init['lxc.init.gid'] if final_init.get('lxc.init.gid') else ''}")
+    else:
+        print(f"WARN\tcompose user '{opts['user']}' is not numeric (or root); set lxc.init.uid/gid by hand")
+if opts.get("shm_size"):
+    mib = max(1, opts["shm_size"] // (1 << 20))
+    set_shm = f"lxc.mount.entry: tmpfs dev/shm tmpfs rw,nosuid,nodev,create=dir,size={mib}m 0 0"
+
 out = []
 for l in main:
     key = l.partition(":")[0].strip()
     if key == "lxc.environment.runtime" or key.startswith("lxc.init."):
+        continue
+    if set_shm and key == "lxc.mount.entry" and " dev/shm " in l:
         continue
     if key == "entrypoint" and set_entrypoint is not None:
         l = f"entrypoint: {set_entrypoint}"
@@ -414,6 +617,8 @@ while out and out[-1] == "":
 if set_entrypoint is not None and not any(l.startswith("entrypoint:") for l in out):
     out.append(f"entrypoint: {set_entrypoint}")
 out += [f"{k}: {v}" for k, v in final_init.items() if v is not None]
+if set_shm:
+    out.append(set_shm)
 out += [f"lxc.environment.runtime: {k}={v}" for k, v in final_env.items()]
 with open(conf_path, "w") as f:
     f.write("\n".join(out + ([""] + rest if rest else [""])))
@@ -520,6 +725,32 @@ except:
     
     COMPOSE_FILE="$PROJECT_DIR/docker-compose.$EXT"
     cp "$tmp_compose" "$COMPOSE_FILE"
+
+    # A local compose file brings its .env and env_file files along
+    if [[ ! "$INPUT_SOURCE" =~ ^https?:// ]]; then
+        local src_dir f
+        src_dir=$(dirname "$(readlink -f "$INPUT_SOURCE")")
+        while read -r f; do
+            [ -z "$f" ] && continue
+            if [ -f "$src_dir/$f" ] && [ ! -e "$PROJECT_DIR/$f" ]; then
+                mkdir -p "$(dirname "$PROJECT_DIR/$f")"
+                cp "$src_dir/$f" "$PROJECT_DIR/$f"
+                echo "Copied $f into the project"
+            fi
+        done < <(python3 - "$COMPOSE_FILE" <<'EOF2'
+import sys, yaml
+data = yaml.safe_load(open(sys.argv[1])) or {}
+files = {".env"}
+for svc in (data.get("services") or {}).values():
+    ef = (svc or {}).get("env_file") or []
+    for e in ([ef] if isinstance(ef, (str, dict)) else ef):
+        path = e.get("path") if isinstance(e, dict) else e
+        if path and not path.startswith("/") and ".." not in path.split("/"):
+            files.add(path)
+print("\n".join(sorted(files)))
+EOF2
+)
+    fi
     
     # 3b. Interactive Edit
     if [ -t 0 ]; then
@@ -764,7 +995,15 @@ declare -A GLOBAL_VOL_MAP
 
 # 3. Parse Compose File
 echo "Parsing $COMPOSE_FILE..."
-mapfile -t SERVICES < <(parse_compose)
+while ! load_services; do
+    # Usually a missing ${VAR} for a URL-sourced compose file: let the user fill in .env
+    if [ -t 0 ] && tui_yesno "The compose file could not be resolved (see the terminal output, e.g. a required variable is missing).\n\nEdit $PROJECT_DIR/.env now and retry?"; then
+        nano "$PROJECT_DIR/.env"
+    else
+        tui_msg "Error: The compose file could not be resolved. Nothing was deployed."
+        return 1
+    fi
+done
 
 CURRENT_VMID=$START_VMID
 
@@ -772,7 +1011,7 @@ CURRENT_VMID=$START_VMID
 METADATA_SERVICES_JSON="[]"
 
 for SERVICE_LINE in "${SERVICES[@]}"; do
-    IFS=$'\t' read -r S_NAME S_IMAGE S_ENV_JSON S_VOLS_JSON <<< "$SERVICE_LINE"
+    IFS=$'\t' read -r S_NAME S_IMAGE S_ENV_JSON S_VOLS_JSON S_OPTS_JSON <<< "$SERVICE_LINE"
     
     echo ""
     echo "--- Deploying Service: $S_NAME ---"
@@ -783,7 +1022,7 @@ for SERVICE_LINE in "${SERVICES[@]}"; do
     SERVICE_VOLUMES_LOG="[]"
 
     # --- 1. Volume Processing Preparation ---
-    declare -a PENDING_VOLUMES
+    PENDING_VOLUMES=()
     MP_INDEX=0
     # Process S_VOLS_JSON into an array for later iteration
     if [ -n "$S_VOLS_JSON" ] && [ "$S_VOLS_JSON" != "[]" ]; then
@@ -801,14 +1040,17 @@ for SERVICE_LINE in "${SERVICES[@]}"; do
     
     # Sanitize size (strip G/GB) for ZFS compatibility
     CLEAN_VOL_SIZE=$(echo "$VOL_SIZE" | tr -cd '0-9')
+    # Resources from the compose file (mem_limit/cpus/deploy limits/x-pmxc)
+    eval "$(_opts_shell "$S_OPTS_JSON")"
     
     pct create $CURRENT_VMID "$TEMPLATE_VOLID" \
         --hostname "$S_NAME" \
-        --cores 1 \
-        --memory 512 \
-        --swap 512 \
+        --cores "${OPT_CORES:-1}" \
+        --memory "${OPT_MEMORY:-512}" \
+        --swap "${OPT_SWAP:-512}" \
+        --onboot "${OPT_ONBOOT:-0}" \
         --net0 "name=eth0,bridge=$NET_BRIDGE,firewall=1,$NET_OPTS" \
-        --rootfs "$ROOTFS_STORAGE:$CLEAN_VOL_SIZE" \
+        --rootfs "$ROOTFS_STORAGE:${OPT_ROOTFS_SIZE:-$CLEAN_VOL_SIZE}" \
         --features nesting=1 \
         --unprivileged 1 \
         --start 0 || { echo "Error: Failed to create container $CURRENT_VMID"; exit 1; }
@@ -866,7 +1108,7 @@ for SERVICE_LINE in "${SERVICES[@]}"; do
 
     # --- 6. Environment (image defaults + compose) ---
     echo "Setting environment variables..."
-    _apply_runtime "$CURRENT_VMID" "" "" "$(_template_path "$TEMPLATE_VOLID")" "$S_ENV_JSON"
+    _apply_runtime "$CURRENT_VMID" "" "" "$(_template_path "$TEMPLATE_VOLID")" "$S_ENV_JSON" "$S_OPTS_JSON" | sed -n 's/^\(SET\|WARN\|NOTE\)\t/  /p'
     echo "Environment variables set."
 
     # --- 7. Start ---
@@ -1041,7 +1283,7 @@ _move_data_volumes() {
 # deletes every volume it owns (including detached "unused" ones), so data
 # volumes are parked on a staging container while the service is rebuilt.
 update_service() {
-    local name="$1" vmid="$2" image="$3" env_json="$4" vols_json="$5" old_template="$6"
+    local name="$1" vmid="$2" image="$3" env_json="$4" vols_json="$5" old_template="$6" opts_json="$7"
     local conf="/etc/pve/lxc/${vmid}.conf"
 
     echo ""
@@ -1084,6 +1326,10 @@ update_service() {
     done < <(_describe_container "$vmid")
     rootfs_storage="${rootfs_storage:-$ROOTFS_STORAGE}"
     rootfs_size="${rootfs_size:-8}"
+    # Compose resources (mem_limit/cpus/deploy limits/x-pmxc) override the
+    # container's current values; unset ones keep what the container has.
+    eval "$(_opts_shell "$opts_json")"
+    if [ -n "$OPT_ROOTFS_SIZE" ] && [ "$OPT_ROOTFS_SIZE" -gt "$rootfs_size" ]; then rootfs_size="$OPT_ROOTFS_SIZE"; fi
 
     local backup="$PROJECT_DIR/${vmid}-$(date +%Y%m%d-%H%M%S).conf.bak"
     cp "$conf" "$backup"
@@ -1162,6 +1408,11 @@ update_service() {
     for i in "${!bind_keys[@]}"; do
         pct set "$vmid" "--${bind_keys[$i]}" "${bind_vals[$i]}" || echo "Warning: could not restore bind mount ${bind_keys[$i]}"
     done
+    local opt val
+    for opt in cores memory swap onboot; do
+        val="OPT_${opt^^}"
+        [ -n "${!val}" ] && { pct set "$vmid" "--$opt" "${!val}" || echo "Warning: could not set $opt"; }
+    done
 
     # 5. Bring the data back
     if ! _move_data_volumes "$stage" "$vmid" "${data_keys[@]}"; then
@@ -1185,19 +1436,20 @@ update_service() {
 
     # 6. Runtime settings: new image defaults, previous customisations
     #    (entrypoint, env, init user/cwd) and the compose environment
-    local kind msg
-    while IFS=$'\t' read -r kind msg; do
-        case "$kind" in
-            KEPT) echo "Kept $msg" ;;
-            NOTE) echo "Note: $msg" ;;
-            WARN) echo "WARNING: $msg" ;;
-        esac
-    done < <(_apply_runtime "$vmid" "$backup" "$(_template_path "$old_template")" "$(_template_path "$TEMPLATE_VOLID")" "$env_json")
     if [ ${#raw_lines[@]} -gt 0 ]; then
         local tmp_conf="$TMP_DIR/$vmid.conf"
         { printf '%s\n' "${raw_lines[@]}" | grep '^#'; grep -v '^#' "$conf"; printf '%s\n' "${raw_lines[@]}" | grep -v '^#'; } > "$tmp_conf"
         cat "$tmp_conf" > "$conf"
     fi
+    local kind msg
+    while IFS=$'\t' read -r kind msg; do
+        case "$kind" in
+            KEPT) echo "Kept $msg" ;;
+            SET) echo "Set $msg" ;;
+            NOTE) echo "Note: $msg" ;;
+            WARN) echo "WARNING: $msg" ;;
+        esac
+    done < <(_apply_runtime "$vmid" "$backup" "$(_template_path "$old_template")" "$(_template_path "$TEMPLATE_VOLID")" "$env_json" "$opts_json")
 
     if [ "$was_running" = "true" ]; then
         echo "Starting container $vmid..."
@@ -1305,15 +1557,18 @@ update_project() {
 for s in json.load(open(sys.argv[1])).get("services", []):
     print(str(s.get("name")) + "\t" + str(s.get("vmid")) + "\t" + str(s.get("template") or ""))' "$METADATA_FILE")
 
-    mapfile -t SERVICES < <(parse_compose)
+    if ! load_services; then
+        _notify "Error: The compose file could not be resolved. Nothing was changed."
+        return 1
+    fi
     if [ ${#SERVICES[@]} -eq 0 ]; then
         _notify "Error: No services found in $COMPOSE_FILE."
         return 1
     fi
 
-    local summary="" line S_NAME S_IMAGE S_ENV_JSON S_VOLS_JSON
+    local summary="" line S_NAME S_IMAGE S_ENV_JSON S_VOLS_JSON S_OPTS_JSON
     for line in "${SERVICES[@]}"; do
-        IFS=$'\t' read -r S_NAME S_IMAGE S_ENV_JSON S_VOLS_JSON <<< "$line"
+        IFS=$'\t' read -r S_NAME S_IMAGE S_ENV_JSON S_VOLS_JSON S_OPTS_JSON <<< "$line"
         summary="$summary\n- $S_NAME ($S_IMAGE) -> VMID ${vmid_of[$S_NAME]:-not deployed}"
     done
     if ! _confirm "Update '$p_name'?\n$summary\n\nEach container is rebuilt from a freshly pulled image under the same VMID. Data volumes are moved aside and back, never deleted."; then
@@ -1323,13 +1578,13 @@ for s in json.load(open(sys.argv[1])).get("services", []):
     # 4. Update each service
     local failed=0
     for line in "${SERVICES[@]}"; do
-        IFS=$'\t' read -r S_NAME S_IMAGE S_ENV_JSON S_VOLS_JSON <<< "$line"
+        IFS=$'\t' read -r S_NAME S_IMAGE S_ENV_JSON S_VOLS_JSON S_OPTS_JSON <<< "$line"
         if [ -z "${vmid_of[$S_NAME]}" ]; then
             echo "Skipping '$S_NAME': not deployed yet (new service in the compose file)."
             continue
         fi
         UPDATED_TEMPLATE=""
-        if update_service "$S_NAME" "${vmid_of[$S_NAME]}" "$S_IMAGE" "$S_ENV_JSON" "$S_VOLS_JSON" "${template_of[$S_NAME]}"; then
+        if update_service "$S_NAME" "${vmid_of[$S_NAME]}" "$S_IMAGE" "$S_ENV_JSON" "$S_VOLS_JSON" "${template_of[$S_NAME]}" "$S_OPTS_JSON"; then
             _set_service_template "$S_NAME" "$UPDATED_TEMPLATE"
         else
             failed=$((failed + 1))
