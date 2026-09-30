@@ -1206,10 +1206,11 @@ print(f"order={position}{up}")
 EOF
 }
 
-# Guess which OCI template a container was built from: the template whose
-# image environment matches the container's config best (every image
-# variable present with the same value, most variables wins). Prints the volid
-# or nothing.
+# Guess which OCI template a container was built from: every image variable
+# must be present in the container config with the same value. Ties (images
+# with identical environments, e.g. Authentik's proxy and ldap outposts) go to
+# the template whose default entrypoint matches the container's, then to the
+# one with the most variables. Prints the volid or nothing.
 _detect_template() {
     local vmid="$1" storage="$2"
     local candidates
@@ -1221,14 +1222,19 @@ _detect_template() {
         [ -n "$v" ] && paths+=("$v=$(pvesm path "$v" 2>/dev/null)")
     done <<< "$candidates"
     python3 - "/etc/pve/lxc/$vmid.conf" "${paths[@]}" <<'EOF'
-import json, sys, tarfile
-conf_env = {}
+import json, shlex, sys, tarfile
+conf_env, conf_ep = {}, None
 for line in open(sys.argv[1]):
     if line.startswith("["):
         break
     if line.startswith("lxc.environment.runtime:"):
         k, _, v = line.split(":", 1)[1].strip().partition("=")
         conf_env[k] = v
+    elif line.startswith("entrypoint:"):
+        try:
+            conf_ep = shlex.split(line.split(":", 1)[1].strip())
+        except ValueError:
+            conf_ep = None
 best = None
 for item in sys.argv[2:]:
     volid, _, path = item.partition("=")
@@ -1241,17 +1247,18 @@ for item in sys.argv[2:]:
             man = blob(json.load(t.extractfile("index.json"))["manifests"][0]["digest"])
             if "manifests" in man:
                 man = blob(man["manifests"][0]["digest"])
-            env = (blob(man["config"]["digest"]).get("config") or {}).get("Env") or []
+            cfg = blob(man["config"]["digest"]).get("config") or {}
     except Exception:
         continue
-    pairs = [e.partition("=") for e in env]
+    pairs = [e.partition("=") for e in cfg.get("Env") or []]
     if not pairs or any(conf_env.get(k) != v for k, _, v in pairs):
         continue
-    score = (len(pairs), volid)
+    default_ep = (cfg.get("Entrypoint") or []) + (cfg.get("Cmd") or [])
+    score = (default_ep == conf_ep, len(pairs), volid)
     if best is None or score > best:
         best = score
 if best:
-    print(best[1])
+    print(best[-1])
 EOF
 }
 
@@ -1295,7 +1302,9 @@ if opts.get("command") is not None or opts.get("entrypoint") is not None:
     ep = opts["entrypoint"] if opts.get("entrypoint") is not None else (cfg.get("Entrypoint") or [])
     cmd = opts["command"] if opts.get("command") is not None else ([] if opts.get("entrypoint") is not None else (cfg.get("Cmd") or []))
     new = shlex.join(ep + cmd)
-    if new != conf.get("entrypoint"):
+    if not cfg and opts.get("entrypoint") is None:
+        lines.append(f"entrypoint: {mask(conf.get('entrypoint'))!r} -> the new image's entrypoint + {mask(shlex.join(cmd))!r} (from compose; build image unknown, resolved at update)")
+    elif new != conf.get("entrypoint"):
         lines.append(f"entrypoint: {mask(conf.get('entrypoint'))!r} -> {mask(new)!r} (from compose, based on the current image's entrypoint)")
 else:
     lines.append(f"entrypoint: kept if customised, else the new image's default (now {mask(conf.get('entrypoint'))!r})")
