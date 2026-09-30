@@ -57,8 +57,9 @@ For each service the update:
 1. Pulls the image to a new, timestamped template (so `:latest` really is re-pulled) and creates a staging container from it. If either fails, nothing has been touched.
 2. Stops the service and moves its data volumes onto the staging container (`pct move-volume`).
 3. Destroys the old container **without** `--purge` (it stays in backup jobs/HA) and recreates it from the new image under the **same VMID**.
-4. Restores network config (MAC/IP), cores, memory, swap, tags, description, features, bind mounts and the container firewall rules, moves the data volumes back and re-applies the compose environment.
-5. Starts the service if it was running, removes the staging container and deletes old templates for that image (keeping the current and previous one).
+4. Restores network config (MAC/IP), cores, memory, swap, tags, description, features, bind mounts and the container firewall rules, and moves the data volumes back.
+5. Carries over runtime customisations. PVE generates `entrypoint`, the environment and `lxc.init.*` (user/working dir) from the image when a container is created and stores them in `<vmid>.conf`. The update compares the container's values with what PVE would have generated from the image it was built from (recorded in `metadata.json` as `template`): customised values are kept (e.g. `entrypoint: dumb-init -- ak worker`), everything else follows the new image, and the compose `environment` is applied on top. If the image changed its own default entrypoint while you have a custom one, the update warns you.
+6. Starts the service if it was running, removes the staging container and deletes old templates for that image (keeping the current and previous one).
 
 The previous container config (and firewall rules) are saved in the project directory as `<vmid>-<timestamp>.conf.bak` / `.fw.bak`.
 
@@ -79,7 +80,7 @@ An update refuses to start for a container that has **snapshots** (PVE cannot mo
     *   *Workaround*: Try using a different base image (e.g., `debian`) or wait for upstream Proxmox fixes.
 *   **Restart Policies**: Does not currently map `restart` policies to Proxmox startup options.
 *   **Compose support is partial**: only `image`, `environment` and `volumes` are read. `env_file`, `.env`/`${VAR}` interpolation, `command`, `entrypoint` and `depends_on` are not supported yet.
-*   **Environment on update**: variables come from the new image plus the compose file. Variables that were added to a container config by hand are reported but not carried over.
+*   **Unknown build image**: if a container's original template is no longer on disk, the update can't tell image defaults from customisations. It keeps the entrypoint and init user/cwd as they are, lets the new image set the environment variables it defines, and lists the ones it replaced.
 *   **Deleting a project and keeping data**: PVE deletes every volume a container owns when it is destroyed, so "keep data" leaves the containers stopped (tagged `pmxc-detached`, onboot off) instead of destroying them.
 
 ## Disclaimer

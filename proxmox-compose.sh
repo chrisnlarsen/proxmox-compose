@@ -246,15 +246,178 @@ _prune_templates() {
     done < <(_list_templates "$image")
 }
 
-# Append compose environment variables to a container config.
-_inject_env() {
-    local vmid="$1" env_json="$2"
-    echo "$env_json" | python3 -c "
-import sys, json
-env = json.load(sys.stdin)
-for k, v in env.items():
-    print(f'lxc.environment.runtime: {k}={v}')
-" >> "/etc/pve/lxc/${vmid}.conf"
+# Filesystem path of a template volid ("" if it doesn't exist).
+_template_path() {
+    [ -z "$1" ] && return
+    local path
+    path=$(pvesm path "$1" 2>/dev/null) && [ -f "$path" ] && echo "$path"
+}
+
+# Set a (stopped) container's runtime settings: environment, entrypoint and
+# lxc.init.* user/cwd.
+#
+# PVE builds these from the OCI image config when a container is created and
+# stores them in <vmid>.conf, where they persist and can be customised
+# (e.g. entrypoint "dumb-init -- ak worker"). When a container is rebuilt from
+# a newer image, settings that differ from what PVE generated from the *old*
+# image are customisations and are carried over; everything else follows the
+# new image. Compose environment values always win.
+#
+# Args: vmid, old config file ("" for a fresh install), old template path
+# ("" if unknown), new template path, compose env JSON.
+# The env list is written directly as lxc.environment.runtime lines (the
+# format PVE stores it in); the NUL-separated `env` option can't be passed
+# on a command line.
+_apply_runtime() {
+    python3 - "$@" <<'EOF'
+import json, shlex, sys, tarfile
+
+vmid, old_conf_path, old_tmpl, new_tmpl, compose_env_json = sys.argv[1:6]
+conf_path = f"/etc/pve/lxc/{vmid}.conf"
+
+def oci_config(path):
+    if not path:
+        return None
+    try:
+        with tarfile.open(path) as t:
+            blob = lambda d: json.load(t.extractfile("blobs/" + d.replace(":", "/", 1)))
+            man = blob(json.load(t.extractfile("index.json"))["manifests"][0]["digest"])
+            if "manifests" in man:  # nested image index
+                man = blob(man["manifests"][0]["digest"])
+            return blob(man["config"]["digest"]).get("config") or {}
+    except Exception as e:
+        print(f"NOTE\tcould not read image config from {path}: {e}")
+        return None
+
+def env_dict(entries):
+    d = {}
+    for e in entries or []:
+        k, _, v = e.partition("=")
+        d[k] = v
+    return d
+
+def default_entrypoint(cfg):
+    # Mirrors PVE::LXC::Create::restore_oci_archive
+    cmd = (cfg.get("Entrypoint") or []) + (cfg.get("Cmd") or [])
+    return cmd if cmd and cmd[0] != "/sbin/init" else None
+
+def default_init(cfg):
+    # lxc.init.* values PVE derives from the image; None = can't tell (named user)
+    d = {"lxc.init.cwd": cfg.get("WorkingDir") or None}
+    user = cfg.get("User") or ""
+    if not user:
+        d.update({"lxc.init.uid": None, "lxc.init.gid": None, "lxc.init.groups": None})
+    else:
+        u, _, g = user.partition(":")
+        if u.isdigit() and (not g or g.isdigit()):
+            d["lxc.init.uid"] = u
+            if g:
+                d["lxc.init.gid"] = g
+    return d
+
+def read_main(path):
+    """(lines, main_len): config lines and the length of the main section."""
+    with open(path) as f:
+        lines = f.read().split("\n")
+    n = next((i for i, l in enumerate(lines) if l.startswith("[")), len(lines))
+    return lines, n
+
+def settings(lines):
+    entrypoint, env, init = None, [], {}
+    for l in lines:
+        key, _, val = l.partition(":")
+        key, val = key.strip(), val.strip()
+        if key == "entrypoint":
+            entrypoint = val
+        elif key == "lxc.environment.runtime":
+            env.append(val)
+        elif key.startswith("lxc.init."):
+            init[key] = val
+    return entrypoint, env_dict(env), init
+
+old_cfg = oci_config(old_tmpl)
+new_cfg = oci_config(new_tmpl) or {}
+compose_env = json.loads(compose_env_json or "{}")
+
+lines, main_len = read_main(conf_path)
+main, rest = lines[:main_len], lines[main_len:]
+new_entrypoint, new_env, new_init = settings(main)
+# The freshly created config already holds the new image's env; prefer the
+# image config itself when readable so ordering follows the image.
+if new_cfg.get("Env"):
+    new_env = env_dict(new_cfg["Env"])
+
+final_env = dict(new_env)
+set_entrypoint = None
+final_init = dict(new_init)
+
+if old_conf_path:
+    old_lines, old_len = read_main(old_conf_path)
+    old_entrypoint, old_env, old_init = settings(old_lines[:old_len])
+
+    if old_cfg is not None:
+        # Entrypoint: keep it only if it was customised
+        default = default_entrypoint(old_cfg)
+        try:
+            customised = (shlex.split(old_entrypoint) if old_entrypoint else None) != default
+        except ValueError:
+            customised = True
+        if customised and old_entrypoint:
+            set_entrypoint = old_entrypoint
+            print(f"KEPT\tcustom entrypoint: {old_entrypoint}")
+            new_default = default_entrypoint(new_cfg)
+            if new_default != default:
+                show = lambda c: shlex.join(c) if c else "/sbin/init"
+                print(f"WARN\tthe image changed its default entrypoint from '{show(default)}' to "
+                      f"'{show(new_default)}'. Your custom entrypoint was kept; check that it still "
+                      f"works (pct set {vmid} --entrypoint ...)")
+        # Env: keep values that differ from the old image's defaults
+        old_img_env = env_dict(old_cfg.get("Env"))
+        for k, v in old_env.items():
+            if old_img_env.get(k) != v:
+                final_env[k] = v
+        # lxc.init.*: keep values that differ from the old image's defaults
+        defaults = default_init(old_cfg)
+        for k, v in old_init.items():
+            if k in defaults and defaults[k] != v:
+                final_init[k] = v
+                print(f"KEPT\tcustom {k}: {v}")
+    else:
+        # Old image unknown: can't tell defaults from customisations.
+        # Keep the entrypoint and init user/cwd (changing them can break the
+        # service or file ownership); let the new image own the env keys it sets.
+        if old_entrypoint:
+            set_entrypoint = old_entrypoint
+        final_init.update(old_init)
+        replaced = []
+        for k, v in old_env.items():
+            if k in new_env:
+                if new_env[k] != v:
+                    replaced.append(k)
+            else:
+                final_env[k] = v
+        print("NOTE\told image config unavailable: kept the previous entrypoint and init user/cwd as-is"
+              + (f"; took the new image's value for: {' '.join(replaced)}" if replaced else ""))
+
+final_env.update({k: "" if v is None else str(v) for k, v in compose_env.items()})
+
+out = []
+for l in main:
+    key = l.partition(":")[0].strip()
+    if key == "lxc.environment.runtime" or key.startswith("lxc.init."):
+        continue
+    if key == "entrypoint" and set_entrypoint is not None:
+        l = f"entrypoint: {set_entrypoint}"
+    out.append(l)
+while out and out[-1] == "":
+    out.pop()
+if set_entrypoint is not None and not any(l.startswith("entrypoint:") for l in out):
+    out.append(f"entrypoint: {set_entrypoint}")
+out += [f"{k}: {v}" for k, v in final_init.items() if v is not None]
+out += [f"lxc.environment.runtime: {k}={v}" for k, v in final_env.items()]
+with open(conf_path, "w") as f:
+    f.write("\n".join(out + ([""] + rest if rest else [""])))
+EOF
 }
 
 _detect_bridges() {
@@ -701,10 +864,10 @@ for SERVICE_LINE in "${SERVICES[@]}"; do
         fi
     done
 
-    # --- 6. Inject Env Vars ---
+    # --- 6. Environment (image defaults + compose) ---
     echo "Setting environment variables..."
-    _inject_env "$CURRENT_VMID" "$S_ENV_JSON"
-    echo "Environment variables injected."
+    _apply_runtime "$CURRENT_VMID" "" "" "$(_template_path "$TEMPLATE_VOLID")" "$S_ENV_JSON"
+    echo "Environment variables set."
 
     # --- 7. Start ---
     echo "Starting container..."
@@ -719,6 +882,7 @@ services.append({
     'name': '$S_NAME',
     'vmid': $CURRENT_VMID,
     'container_storage': '$ROOTFS_STORAGE',
+    'template': '$TEMPLATE_VOLID',
     'volumes': json.loads('$SERVICE_VOLUMES_LOG')
 })
 print(json.dumps(services))
@@ -813,7 +977,6 @@ _notify() {
 #   DATAMP <key> <mp-target>  storage-backed mount points (moved, never destroyed)
 #   BINDMP <key> <value>      host-path bind mounts (re-added verbatim)
 #   RAW <line>                description comments and non-image lxc.* lines
-#   ENV <key>                 environment keys currently set
 _describe_container() {
     python3 - "/etc/pve/lxc/$1.conf" <<'EOF'
 import re, sys
@@ -834,9 +997,7 @@ with open(sys.argv[1]) as f:
         key, value = line.split(":", 1)
         key, value = key.strip(), value.strip()
         if key.startswith("lxc."):
-            if key == "lxc.environment.runtime":
-                print(f"ENV\t{value.split('=', 1)[0]}")
-            elif not key.startswith(image_lxc):
+            if not key.startswith(image_lxc):
                 print(f"RAW\t{line}")
             continue
         if key == "rootfs":
@@ -880,7 +1041,7 @@ _move_data_volumes() {
 # deletes every volume it owns (including detached "unused" ones), so data
 # volumes are parked on a staging container while the service is rebuilt.
 update_service() {
-    local name="$1" vmid="$2" image="$3" env_json="$4" vols_json="$5"
+    local name="$1" vmid="$2" image="$3" env_json="$4" vols_json="$5" old_template="$6"
     local conf="/etc/pve/lxc/${vmid}.conf"
 
     echo ""
@@ -908,7 +1069,7 @@ update_service() {
     fi
 
     local rootfs_storage="" rootfs_size="" hostname="$name" unpriv="1"
-    local -a keep_keys=() keep_vals=() data_keys=() data_targets=() bind_keys=() bind_vals=() raw_lines=() old_env=()
+    local -a keep_keys=() keep_vals=() data_keys=() data_targets=() bind_keys=() bind_vals=() raw_lines=()
     local type a b
     while IFS=$'\t' read -r type a b; do
         case "$type" in
@@ -919,7 +1080,6 @@ update_service() {
             DATAMP) data_keys+=("$a"); data_targets+=("$b") ;;
             BINDMP) bind_keys+=("$a"); bind_vals+=("$b") ;;
             RAW) raw_lines+=("$a") ;;
-            ENV) old_env+=("$a") ;;
         esac
     done < <(_describe_container "$vmid")
     rootfs_storage="${rootfs_storage:-$ROOTFS_STORAGE}"
@@ -930,8 +1090,13 @@ update_service() {
     echo "Saved current config to $backup"
 
     # 2. Pull the new image and prove it can be turned into a container
-    local prev_template
-    prev_template=$(_list_templates "$image" | LC_ALL=C sort | tail -n 1)
+    # The template this container was built from tells us which runtime
+    # settings are image defaults and which are customisations. Older
+    # metadata doesn't record it; fall back to the newest template for the image.
+    if [ -z "$(_template_path "$old_template")" ]; then
+        old_template=$(_list_templates "$image" | LC_ALL=C sort | tail -n 1)
+        [ -n "$old_template" ] && echo "Assuming $vmid was built from $old_template"
+    fi
     _pull_image "$image" || return 1
 
     local stage
@@ -1018,27 +1183,45 @@ update_service() {
         pct set "$vmid" "-mp$n" "$VOL_STORAGE:$(echo "$VOL_SIZE" | tr -cd '0-9'),mp=$v_target" || echo "Warning: could not create volume for $v_target"
     done < <(echo "$vols_json" | python3 -c "import sys, json; [print(f\"{v['type']}\t{v['source']}\t{v['target']}\") for v in json.load(sys.stdin)]")
 
-    # 6. Environment: the new image's own variables plus the compose file's
-    _inject_env "$vmid" "$env_json"
+    # 6. Runtime settings: new image defaults, previous customisations
+    #    (entrypoint, env, init user/cwd) and the compose environment
+    local kind msg
+    while IFS=$'\t' read -r kind msg; do
+        case "$kind" in
+            KEPT) echo "Kept $msg" ;;
+            NOTE) echo "Note: $msg" ;;
+            WARN) echo "WARNING: $msg" ;;
+        esac
+    done < <(_apply_runtime "$vmid" "$backup" "$(_template_path "$old_template")" "$(_template_path "$TEMPLATE_VOLID")" "$env_json")
     if [ ${#raw_lines[@]} -gt 0 ]; then
         local tmp_conf="$TMP_DIR/$vmid.conf"
         { printf '%s\n' "${raw_lines[@]}" | grep '^#'; grep -v '^#' "$conf"; printf '%s\n' "${raw_lines[@]}" | grep -v '^#'; } > "$tmp_conf"
         cat "$tmp_conf" > "$conf"
     fi
 
-    local dropped="" k
-    for k in "${old_env[@]}"; do
-        grep -q "^lxc.environment.runtime: $k=" "$conf" || dropped="$dropped $k"
-    done
-    [ -n "$dropped" ] && echo "Note: these variables were set before but come from neither the new image nor the compose file, so they were not carried over:$dropped"
-
     if [ "$was_running" = "true" ]; then
         echo "Starting container $vmid..."
         pct start "$vmid" || echo "Warning: Container $vmid failed to start."
     fi
 
-    _prune_templates "$image" "$TEMPLATE_VOLID" "$prev_template"
+    _prune_templates "$image" "$TEMPLATE_VOLID" "$old_template"
+    UPDATED_TEMPLATE="$TEMPLATE_VOLID"
     echo "Service $name updated."
+}
+
+# Record which template a service's container was built from.
+_set_service_template() {
+    python3 - "$METADATA_FILE" "$1" "$2" <<'EOF2'
+import json, sys
+path, name, template = sys.argv[1:4]
+with open(path) as f:
+    meta = json.load(f)
+for s in meta.get("services", []):
+    if s.get("name") == name:
+        s["template"] = template
+with open(path, "w") as f:
+    json.dump(meta, f, indent=2)
+EOF2
 }
 
 # Rewrite the services section of metadata from the live container configs.
@@ -1113,13 +1296,14 @@ update_project() {
     fi
 
     # 3. Match compose services to deployed containers
-    local -A vmid_of=()
-    local s_name s_vmid
-    while IFS=$'\t' read -r s_name s_vmid; do
+    local -A vmid_of=() template_of=()
+    local s_name s_vmid s_tmpl
+    while IFS=$'\t' read -r s_name s_vmid s_tmpl; do
         vmid_of["$s_name"]="$s_vmid"
+        template_of["$s_name"]="$s_tmpl"
     done < <(python3 -c 'import json, sys
 for s in json.load(open(sys.argv[1])).get("services", []):
-    print(str(s.get("name")) + "\t" + str(s.get("vmid")))' "$METADATA_FILE")
+    print(str(s.get("name")) + "\t" + str(s.get("vmid")) + "\t" + str(s.get("template") or ""))' "$METADATA_FILE")
 
     mapfile -t SERVICES < <(parse_compose)
     if [ ${#SERVICES[@]} -eq 0 ]; then
@@ -1144,7 +1328,10 @@ for s in json.load(open(sys.argv[1])).get("services", []):
             echo "Skipping '$S_NAME': not deployed yet (new service in the compose file)."
             continue
         fi
-        if ! update_service "$S_NAME" "${vmid_of[$S_NAME]}" "$S_IMAGE" "$S_ENV_JSON" "$S_VOLS_JSON"; then
+        UPDATED_TEMPLATE=""
+        if update_service "$S_NAME" "${vmid_of[$S_NAME]}" "$S_IMAGE" "$S_ENV_JSON" "$S_VOLS_JSON" "${template_of[$S_NAME]}"; then
+            _set_service_template "$S_NAME" "$UPDATED_TEMPLATE"
+        else
             failed=$((failed + 1))
             # A failure with volumes still parked must stop everything
             [ -n "$PARKED_VOLUMES_ON" ] && exit 1
