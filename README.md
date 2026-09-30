@@ -74,6 +74,16 @@ An update refuses to start for a container that has **snapshots** (PVE cannot mo
 *   **Environment Variables**: Parses `environment` sections and injects them into the container configuration (`lxc.environment`).
 *   **Container Creation**: Automatically creates unprivileged LXC containers for each service.
 
+### Adopting existing containers
+
+Containers that were set up by hand (or by another tool) can be brought under a project without rebuilding them:
+
+```bash
+./proxmox-compose.sh adopt ./docker-compose.yml postgresql=903 server=901 worker=902
+```
+
+`adopt` maps each compose service to an existing container, takes the network and storage settings from the containers, detects which OCI template each container was built from (by matching the image environment), writes the project hosts file and adds its mount entry (effective at the next start). Nothing is restarted. It then prints what the first `update` would change - image, entrypoint, environment (secrets masked), mounts, resources - so you can adjust the compose file or `.env` before running `update`.
+
 ## Compose support
 
 | Compose key | Becomes |

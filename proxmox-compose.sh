@@ -1206,6 +1206,232 @@ print(f"order={position}{up}")
 EOF
 }
 
+# Guess which OCI template a container was built from: the template whose
+# image environment matches the container's config best (every image
+# variable present with the same value, most variables wins). Prints the volid
+# or nothing.
+_detect_template() {
+    local vmid="$1" storage="$2"
+    local candidates
+    candidates=$(pvesm list "$storage" --content vztmpl 2>/dev/null | awk 'NR>1 {print $1}' | grep -E '\.tar$')
+    [ -z "$candidates" ] && return
+    local paths=()
+    local v
+    while read -r v; do
+        [ -n "$v" ] && paths+=("$v=$(pvesm path "$v" 2>/dev/null)")
+    done <<< "$candidates"
+    python3 - "/etc/pve/lxc/$vmid.conf" "${paths[@]}" <<'EOF'
+import json, sys, tarfile
+conf_env = {}
+for line in open(sys.argv[1]):
+    if line.startswith("["):
+        break
+    if line.startswith("lxc.environment.runtime:"):
+        k, _, v = line.split(":", 1)[1].strip().partition("=")
+        conf_env[k] = v
+best = None
+for item in sys.argv[2:]:
+    volid, _, path = item.partition("=")
+    try:
+        with tarfile.open(path) as t:
+            names = set(t.getnames())
+            if "index.json" not in names:
+                continue
+            blob = lambda d: json.load(t.extractfile("blobs/" + d.replace(":", "/", 1)))
+            man = blob(json.load(t.extractfile("index.json"))["manifests"][0]["digest"])
+            if "manifests" in man:
+                man = blob(man["manifests"][0]["digest"])
+            env = (blob(man["config"]["digest"]).get("config") or {}).get("Env") or []
+    except Exception:
+        continue
+    pairs = [e.partition("=") for e in env]
+    if not pairs or any(conf_env.get(k) != v for k, _, v in pairs):
+        continue
+    score = (len(pairs), volid)
+    if best is None or score > best:
+        best = score
+if best:
+    print(best[1])
+EOF
+}
+
+# Show what the first update of an adopted service would change.
+_preview_service() {
+    local name="$1" vmid="$2" template="$3" image="$4" env_json="$5" vols_json="$6" opts_json="$7"
+    python3 - "$name" "/etc/pve/lxc/$vmid.conf" "$(_template_path "$template")" "$image" "$env_json" "$vols_json" "$opts_json" <<'EOF'
+import json, re, shlex, sys, tarfile
+name, conf_path, tmpl, image, env_json, vols_json, opts_json = sys.argv[1:8]
+env, vols, opts = json.loads(env_json), json.loads(vols_json), json.loads(opts_json)
+conf, cenv = {}, {}
+mounts = set()
+for line in open(conf_path):
+    if line.startswith("["):
+        break
+    k, _, v = line.partition(":")
+    k, v = k.strip(), v.strip()
+    if k == "lxc.environment.runtime":
+        a, _, b = v.partition("=")
+        cenv[a] = b
+    elif re.fullmatch(r"mp\d+", k):
+        m = re.search(r"(?:^|,)mp=([^,]+)", v)
+        if m:
+            mounts.add(m.group(1))
+    else:
+        conf[k] = v
+cfg = {}
+if tmpl:
+    with tarfile.open(tmpl) as t:
+        blob = lambda d: json.load(t.extractfile("blobs/" + d.replace(":", "/", 1)))
+        man = blob(json.load(t.extractfile("index.json"))["manifests"][0]["digest"])
+        if "manifests" in man:
+            man = blob(man["manifests"][0]["digest"])
+        cfg = blob(man["config"]["digest"]).get("config") or {}
+secret = re.compile(r"PASS|SECRET|TOKEN|KEY", re.I)
+show = lambda k, v: "***" if secret.search(k) else v
+# secrets can also sit inside command lines, e.g. "export POSTGRES_PASSWORD=..."
+mask = lambda text: re.sub(r"(\w*(?:PASS|SECRET|TOKEN|KEY)\w*=)(\S+)", r"\1***", text or "", flags=re.I)
+lines = []
+if opts.get("command") is not None or opts.get("entrypoint") is not None:
+    ep = opts["entrypoint"] if opts.get("entrypoint") is not None else (cfg.get("Entrypoint") or [])
+    cmd = opts["command"] if opts.get("command") is not None else ([] if opts.get("entrypoint") is not None else (cfg.get("Cmd") or []))
+    new = shlex.join(ep + cmd)
+    if new != conf.get("entrypoint"):
+        lines.append(f"entrypoint: {mask(conf.get('entrypoint'))!r} -> {mask(new)!r} (from compose, based on the current image's entrypoint)")
+else:
+    lines.append(f"entrypoint: kept if customised, else the new image's default (now {mask(conf.get('entrypoint'))!r})")
+if opts.get("user") is not None:
+    u, _, g = opts["user"].partition(":")
+    u = "0" if u == "root" else u
+    if u != conf.get("lxc.init.uid", "0"):
+        lines.append(f"user: uid {conf.get('lxc.init.uid', '0')} -> {u}")
+for k, v in env.items():
+    if k not in cenv:
+        lines.append(f"env +{k}={show(k, v)}")
+    elif cenv[k] != v:
+        lines.append(f"env ~{k}: {show(k, cenv[k])} -> {show(k, v)}")
+img_env = dict(e.partition("=")[::2] for e in (cfg.get("Env") or []))
+for k in cenv:
+    if k not in env and k not in img_env:
+        lines.append(f"env ={k} (not in compose or image: kept as a customisation)" if tmpl else f"env ?{k} (build image unknown)")
+for v in vols:
+    if v["target"] not in mounts and not v["source"].endswith("docker.sock"):
+        lines.append(f"mount +{v['target']} ({v['source']})")
+for key, conf_key in (("cores", "cores"), ("memory", "memory"), ("onboot", "onboot")):
+    if opts.get(key) is not None and str(opts[key]) != conf.get(conf_key, ""):
+        lines.append(f"{conf_key}: {conf.get(conf_key)} -> {opts[key]}")
+print(f"  {name} (VMID {conf_path.split('/')[-1][:-5]}): image {image}; built from {tmpl.split('/')[-1] if tmpl else 'UNKNOWN template'}")
+for l in lines or ["no differences"]:
+    print(f"    {l}")
+EOF
+}
+
+# Append a line to the main section of a container config (before any
+# snapshot/pending sections). Takes effect at the container's next start.
+_conf_add_line() {
+    python3 - "/etc/pve/lxc/$1.conf" "$2" <<'EOF'
+import sys
+path, new = sys.argv[1:3]
+lines = open(path).read().split("\n")
+n = next((i for i, l in enumerate(lines) if l.startswith("[")), len(lines))
+main, rest = lines[:n], lines[n:]
+while main and main[-1] == "":
+    main.pop()
+main.append(new)
+open(path, "w").write("\n".join(main + ([""] + rest if rest else [""])))
+EOF
+}
+
+# Bring existing containers under a new project without rebuilding them.
+# Args: compose file/URL, then service=vmid pairs.
+adopt_project() {
+    local source="$1"; shift
+    local -A adopt_vmid=()
+    local pair
+    for pair in "$@"; do
+        [[ "$pair" =~ ^([A-Za-z0-9._-]+)=([0-9]+)$ ]] || { echo "Error: expected service=vmid, got '$pair'"; return 1; }
+        adopt_vmid["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+        [ -f "/etc/pve/lxc/${BASH_REMATCH[2]}.conf" ] || { echo "Error: container ${BASH_REMATCH[2]} does not exist"; return 1; }
+    done
+
+    _ingest_project "$source" || return 1
+    if ! load_services; then
+        rm -rf "$PROJECT_DIR"
+        echo "Error: the compose file could not be resolved. Nothing was adopted."
+        return 1
+    fi
+    local line svc missing=""
+    for line in "${SERVICES[@]}"; do
+        svc="${line%%$'\t'*}"
+        [ -n "${adopt_vmid[$svc]}" ] || missing="$missing $svc"
+    done
+    if [ -n "$missing" ]; then
+        rm -rf "$PROJECT_DIR"
+        echo "Error: no container given for:$missing (use service=vmid). Nothing was adopted."
+        return 1
+    fi
+
+    # Project settings from the first container (and the compose x-pmxc block)
+    eval "$(_project_defaults_shell)"
+    local first="${adopt_vmid[${SERVICES[0]%%$'\t'*}]}" net0
+    net0=$(sed -n 's/^net0: //p' "/etc/pve/lxc/$first.conf" | head -n 1)
+    TARGET_NODE="${TARGET_NODE:-$(basename "$(readlink -f /etc/pve/local)")}"
+    TEMPLATE_STORAGE="${TEMPLATE_STORAGE:-local}"
+    ROOTFS_STORAGE="${ROOTFS_STORAGE:-$(sed -n -E 's/^rootfs: ([^:]+):.*/\1/p' "/etc/pve/lxc/$first.conf")}"
+    VOL_STORAGE="${VOL_STORAGE:-$ROOTFS_STORAGE}"
+    VOL_SIZE="${VOL_SIZE:-16G}"
+    NET_BRIDGE="${NET_BRIDGE:-$(echo "$net0" | grep -o -E 'bridge=[^,]+' | cut -d= -f2)}"
+    NET_TAG="${NET_TAG:-$(echo "$net0" | grep -o -E 'tag=[^,]+' | cut -d= -f2)}"
+    NET_GW="${NET_GW:-$(echo "$net0" | grep -o -E 'gw=[^,]+' | cut -d= -f2)}"
+    NET_CIDR="${NET_CIDR:-$(echo "$net0" | grep -o -E 'ip=[^,]+' | cut -d= -f2)}"
+    if [ -z "$IP_CONFIG" ]; then
+        if [ "$NET_CIDR" = "dhcp" ] || [ -z "$NET_CIDR" ]; then IP_CONFIG="dhcp"; NET_CIDR=""; else IP_CONFIG="static"; fi
+    fi
+    DATA_DIR="${DATA_DIR:-$PROJECT_DIR/volumes}"
+    _save_project_config
+
+    # Services: detected build template and address
+    declare -A SVC_IP=() SVC_ALIAS=()
+    local services_json="[]" vmid tmpl ip all_static="true" s_name s_image s_env s_vols s_opts
+    echo "Detecting the templates the containers were built from..."
+    for line in "${SERVICES[@]}"; do
+        IFS=$'\t' read -r s_name s_image s_env s_vols s_opts <<< "$line"
+        vmid="${adopt_vmid[$s_name]}"
+        tmpl=$(_detect_template "$vmid" "$TEMPLATE_STORAGE")
+        ip=$(sed -n 's/^net0: //p' "/etc/pve/lxc/$vmid.conf" | grep -o -E 'ip=[0-9.]+/[0-9]+' | cut -d= -f2)
+        [ -z "$ip" ] && all_static="false"
+        SVC_IP["$s_name"]="$ip"
+        SVC_ALIAS["$s_name"]=$(python3 -c 'import json, sys; print(json.loads(sys.argv[1]).get("container_name") or "")' "$s_opts")
+        services_json=$(python3 -c 'import json, sys
+l = json.loads(sys.argv[1])
+l.append({"name": sys.argv[2], "vmid": int(sys.argv[3]), "container_storage": sys.argv[4], "template": sys.argv[5], "ip": sys.argv[6], "volumes": []})
+print(json.dumps(l))' "$services_json" "$s_name" "$vmid" "$ROOTFS_STORAGE" "$tmpl" "$ip")
+    done
+    _update_metadata "$services_json"
+    _refresh_metadata
+
+    # Name resolution for the next start (i.e. the first update)
+    if [ "$all_static" = "true" ] && _check_traversable "$PROJECT_DIR"; then
+        _write_hosts_file > "$PROJECT_DIR/hosts"
+        chmod 644 "$PROJECT_DIR/hosts"
+        for line in "${SERVICES[@]}"; do
+            vmid="${adopt_vmid[${line%%$'\t'*}]}"
+            grep -q " etc/hosts " "/etc/pve/lxc/$vmid.conf" || _conf_add_line "$vmid" \
+                "lxc.mount.entry: $PROJECT_DIR/hosts etc/hosts none bind,ro,create=file 0 0"
+        done
+    fi
+
+    echo ""
+    echo "Adopted project '$PROJECT_NAME'. Nothing was restarted. The first update would change:"
+    for line in "${SERVICES[@]}"; do
+        IFS=$'\t' read -r s_name s_image s_env s_vols s_opts <<< "$line"
+        _preview_service "$s_name" "${adopt_vmid[$s_name]}" "$(python3 -c 'import json, sys
+for s in json.load(open(sys.argv[1]))["services"]:
+    if s["name"] == sys.argv[2]: print(s.get("template") or "")' "$METADATA_FILE" "$s_name")" "$s_image" "$s_env" "$s_vols" "$s_opts"
+    done
+    echo ""
+    echo "Review the above, adjust $COMPOSE_FILE / .env if needed, then run: $0 update $PROJECT_NAME"
+}
+
 # Plan a VMID and address for every service in SERVICES.
 # Explicit per-service `x-pmxc: {vmid, ip}` must be free; otherwise VMIDs count
 # up from START_VMID and addresses from NET_CIDR, skipping VMIDs in use.
@@ -2233,6 +2459,7 @@ usage() {
     echo "       $0 list                  List projects"
     echo "       $0 install <file|url> [-y] Install a project (-y: no prompts; settings from x-pmxc)"
     echo "       $0 update <project> [-y] Update a project (-y: no prompts, keep local compose file)"
+    echo "       $0 adopt <file|url> <service>=<vmid>... [-y]  Bring existing containers under a project"
 }
 
 # --- Entry Point ---
@@ -2260,6 +2487,19 @@ case "${1:-}" in
         fi
         [ "${3:-}" = "-y" ] || [ "${3:-}" = "--yes" ] && ASSUME_YES="true"
         update_project "$2"
+        exit $?
+        ;;
+    adopt)
+        if [ -z "${2:-}" ] || [ -z "${3:-}" ]; then
+            usage
+            exit 1
+        fi
+        src="$2"; shift 2
+        args=()
+        for a in "$@"; do
+            case "$a" in -y|--yes) ASSUME_YES="true" ;; *) args+=("$a") ;; esac
+        done
+        adopt_project "$src" "${args[@]}"
         exit $?
         ;;
     -h|--help)
