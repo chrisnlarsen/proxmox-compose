@@ -87,6 +87,8 @@ An update refuses to start for a container that has **snapshots** (PVE cannot mo
 | `restart` | `onboot` (`no` → off, anything else → on) |
 | `mem_limit`, `cpus`, `deploy.resources.limits` | `memory`, `cores` |
 | `volumes` | Mount points, see [Volumes](#volumes) |
+| `depends_on` (list or `condition: service_started / service_healthy / service_completed_successfully`) | Services are created, started and updated in dependency order, waiting for each condition; PVE boot order (`startup: order=N`, with an `up` delay after services others depend on) follows the same order |
+| `healthcheck` (`CMD` / `CMD-SHELL`, `interval`, `timeout`, `retries`, `start_period`) | Run inside the container with `pct exec` (with the container's environment) to wait for `service_healthy`. If a dependency never becomes healthy, the dependent service is started anyway with a warning |
 | `x-pmxc: {cores, memory, swap, rootfs_size, vmid, ip}` | Proxmox-specific overrides per service (memory in MB, rootfs in GB; `ip` with or without `/prefix`) |
 | `container_name` | Extra name for the service in the project hosts file |
 
@@ -139,7 +141,7 @@ A local compose file's `.env` and `env_file` files are copied into the project; 
 *   **OCI Extraction Errors**: Some images (e.g., `postgres:14-alpine`, some `node` images) fail to extract on Proxmox/LXC due to hardlink handling on ZFS. This presents as `IO error: failed to unpack ... File exists`.
     *   *Workaround*: Try using a different base image (e.g., `debian`) or wait for upstream Proxmox fixes.
 *   **Restart Policies**: Does not currently map `restart` policies to Proxmox startup options.
-*   **Not supported yet**: `depends_on`/`healthcheck` ordering. `ports` are ignored (each container has its own IP).
+*   **Ignored**: `ports` (each container has its own IP), `networks`, `labels`, image `HEALTHCHECK` instructions (only compose healthchecks are used).
 *   **Project directory permissions**: the hosts file and shared volumes are bind-mounted into unprivileged containers, so every directory above them must be world-traversable (the default `/var/lib/proxmox-compose` is). The installer checks this.
 *   **Unknown build image**: if a container's original template is no longer on disk, the update can't tell image defaults from customisations. It keeps the entrypoint and init user/cwd as they are, lets the new image set the environment variables it defines, and lists the ones it replaced.
 *   **Deleting a project and keeping data**: PVE deletes every volume a container owns when it is destroyed, so "keep data" leaves the containers stopped (tagged `pmxc-detached`, onboot off) instead of destroying them.

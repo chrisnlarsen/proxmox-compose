@@ -228,6 +228,20 @@ def as_cmd(v):
         return shlex.split(v)
     return [as_str(x) for x in v]
 
+def duration(v, default):
+    """Compose duration ("1m30s", "10s", "500ms", or seconds) -> seconds."""
+    if v is None:
+        return default
+    if isinstance(v, (int, float)):
+        return float(v)
+    total, found = 0.0, False
+    for num, unit in re.findall(r"([\d.]+)(ms|us|ns|h|m|s)", str(v)):
+        found = True
+        total += float(num) * {"h": 3600, "m": 60, "s": 1, "ms": 0.001, "us": 1e-6, "ns": 1e-9}[unit]
+    if not found:
+        fail(f"invalid duration '{v}'")
+    return total
+
 def size_bytes(v):
     if v is None:
         return None
@@ -298,6 +312,29 @@ for name, service in data["services"].items():
             if source and target:
                 volumes.append({"type": v_type, "source": source, "target": target, "ro": bool(v.get("read_only"))})
 
+    # Startup dependencies and healthcheck
+    dep = service.get("depends_on") or {}
+    if isinstance(dep, list):
+        depends_on = {d: "service_started" for d in dep}
+    else:
+        depends_on = {d: (c or {}).get("condition", "service_started") for d, c in dep.items()}
+    health = None
+    hc = service.get("healthcheck") or {}
+    if hc and not hc.get("disable"):
+        test = hc.get("test")
+        cmd = None
+        if isinstance(test, str):
+            cmd = ["sh", "-c", test]
+        elif isinstance(test, list) and test:
+            if test[0] == "CMD":
+                cmd = [as_str(x) for x in test[1:]]
+            elif test[0] == "CMD-SHELL":
+                cmd = ["sh", "-c", " ".join(as_str(x) for x in test[1:])]
+        if cmd:
+            health = {"cmd": cmd, "interval": duration(hc.get("interval"), 30),
+                      "timeout": duration(hc.get("timeout"), 30), "retries": int(hc.get("retries", 3)),
+                      "start_period": duration(hc.get("start_period"), 0)}
+
     # Runtime options
     limits = ((service.get("deploy") or {}).get("resources") or {}).get("limits") or {}
     pmxc = service.get("x-pmxc") or {}
@@ -317,6 +354,8 @@ for name, service in data["services"].items():
         "ip": pmxc.get("ip"),
         "vmid": pmxc.get("vmid"),
         "container_name": service.get("container_name"),
+        "depends_on": depends_on,
+        "healthcheck": health,
     }
     if pmxc.get("memory") and not isinstance(pmxc["memory"], int):
         opts["memory"] = size_bytes(pmxc["memory"]) // (1 << 20)
@@ -1035,6 +1074,138 @@ _own_shared_dirs() {
     done
 }
 
+# Print service names in dependency order (dependencies first). Fails on
+# unknown dependencies or cycles.
+_service_order() {
+    printf '%s\n' "${SERVICES[@]}" > "$TMP_DIR/services.tsv"
+    python3 - "$TMP_DIR/services.tsv" <<'EOF'
+import json, sys
+deps, names = {}, []
+for line in open(sys.argv[1]).read().splitlines():
+    if line.strip():
+        name, _i, _e, _v, opts = line.split("\t")
+        names.append(name)
+        deps[name] = list((json.loads(opts).get("depends_on") or {}).keys())
+order, state = [], {}
+def visit(n, path):
+    if state.get(n) == "done":
+        return
+    if state.get(n) == "visiting":
+        print(f"Error: dependency cycle: {' -> '.join(path + [n])}", file=sys.stderr)
+        sys.exit(1)
+    if n not in deps:
+        print(f"Error: service {path[-1]} depends on unknown service {n}", file=sys.stderr)
+        sys.exit(1)
+    state[n] = "visiting"
+    for d in deps[n]:
+        visit(d, path + [n])
+    state[n] = "done"
+    order.append(n)
+for n in names:
+    visit(n, [])
+print("\n".join(order))
+EOF
+}
+
+# Run a service's compose healthcheck inside its container until it passes,
+# honouring start_period / interval / retries / timeout.
+# The check gets the container's runtime environment (pct exec doesn't).
+_wait_healthy() {
+    local name="$1" vmid="$2" opts="$3"
+    local spec
+    spec=$(python3 - "$opts" "/etc/pve/lxc/$vmid.conf" <<'EOF'
+import json, shlex, sys
+h = json.loads(sys.argv[1] or "{}").get("healthcheck")
+if not h:
+    sys.exit(0)
+env = []
+for line in open(sys.argv[2]):
+    if line.startswith("["):
+        break
+    if line.startswith("lxc.environment.runtime:"):
+        env.append(line.split(":", 1)[1].strip())
+cmd = ["env", "-i"] + env + h["cmd"]
+print(f"HC_CMD={shlex.quote(shlex.join(cmd))}")
+print(f"HC_INTERVAL={max(1, int(h['interval']))}")
+print(f"HC_TIMEOUT={max(1, int(h['timeout']))}")
+print(f"HC_RETRIES={max(1, h['retries'])}")
+print(f"HC_START={int(h['start_period'])}")
+EOF
+)
+    if [ -z "$spec" ]; then
+        echo "Note: $name has no healthcheck; treating 'running' as healthy"
+        _wait_running "$vmid" 60
+        return
+    fi
+    local HC_CMD HC_INTERVAL HC_TIMEOUT HC_RETRIES HC_START
+    eval "$spec"
+    echo "Waiting for $name to become healthy..."
+    local deadline=$(( $(date +%s) + HC_START + HC_RETRIES * (HC_INTERVAL + HC_TIMEOUT) + 30 ))
+    local failures=0 started
+    started=$(date +%s)
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        # shellcheck disable=SC2086
+        if eval "timeout $HC_TIMEOUT pct exec $vmid -- $HC_CMD" >/dev/null 2>&1; then
+            echo "$name is healthy"
+            return 0
+        fi
+        # failures during start_period don't count
+        if [ $(( $(date +%s) - started )) -ge "$HC_START" ]; then
+            failures=$((failures + 1))
+            [ "$failures" -ge "$HC_RETRIES" ] && break
+        fi
+        sleep "$HC_INTERVAL"
+    done
+    echo "Warning: $name did not become healthy"
+    return 1
+}
+
+_wait_running() {
+    local vmid="$1" limit="${2:-60}" t=0
+    while ! pct status "$vmid" 2>/dev/null | grep -q running; do
+        [ "$t" -ge "$limit" ] && return 1
+        sleep 2; t=$((t + 2))
+    done
+}
+
+# Before starting a service, wait for its depends_on conditions.
+# Uses SVC_VMID (name -> vmid) and SVC_OPTS (name -> options JSON).
+_wait_for_deps() {
+    local name="$1" dep cond rc=0
+    while IFS=$'\t' read -r dep cond; do
+        [ -z "$dep" ] && continue
+        case "$cond" in
+            service_healthy)
+                _wait_healthy "$dep" "${SVC_VMID[$dep]}" "${SVC_OPTS[$dep]}" || rc=1 ;;
+            service_completed_successfully)
+                echo "Waiting for $dep to finish..."
+                local t=0
+                while pct status "${SVC_VMID[$dep]}" | grep -q running && [ $t -lt 600 ]; do sleep 3; t=$((t + 3)); done ;;
+            *)
+                _wait_running "${SVC_VMID[$dep]}" 60 || { echo "Warning: $dep is not running"; rc=1; } ;;
+        esac
+    done < <(python3 -c 'import json, sys
+for d, c in (json.loads(sys.argv[1] or "{}").get("depends_on") or {}).items():
+    print(f"{d}\t{c}")' "${SVC_OPTS[$name]}")
+    return $rc
+}
+
+# PVE boot order for a service: position in dependency order; services
+# others wait on get an `up` delay (their healthcheck start period or 30s).
+_startup_value() {
+    local name="$1" position="$2"
+    python3 - "$name" "$position" "${SVC_OPTS_ALL}" <<'EOF'
+import json, sys
+name, position, all_opts = sys.argv[1], int(sys.argv[2]), json.loads(sys.argv[3] or "{}")
+needed = any(name in (o.get("depends_on") or {}) for o in all_opts.values())
+up = ""
+if needed:
+    h = all_opts.get(name, {}).get("healthcheck") or {}
+    up = f",up={max(30, int(h.get('start_period', 0)))}"
+print(f"order={position}{up}")
+EOF
+}
+
 # Plan a VMID and address for every service in SERVICES.
 # Explicit per-service `x-pmxc: {vmid, ip}` must be free; otherwise VMIDs count
 # up from START_VMID and addresses from NET_CIDR, skipping VMIDs in use.
@@ -1129,6 +1300,7 @@ _net_ip_opts() {
 
 install_project() {
     created_vmids=()
+    SVC_POSITION=0
     TARGET_NODE="" TEMPLATE_STORAGE="" ROOTFS_STORAGE="" VOL_STORAGE="" VOL_SIZE=""
     NET_BRIDGE="" NET_TAG="" IP_CONFIG="" NET_CIDR="" NET_GW="" START_VMID="" DATA_DIR=""
     # 1. Project Ingestion
@@ -1285,6 +1457,28 @@ while ! load_services; do
     fi
 done
 
+# Dependency order (depends_on); services are created and started in it
+local ordered
+if ! ordered=$(_service_order); then
+    tui_msg "Error: invalid depends_on (see above)."
+    return 1
+fi
+declare -A SVC_OPTS
+local svc_line
+for svc_line in "${SERVICES[@]}"; do
+    SVC_OPTS["${svc_line%%$'\t'*}"]="${svc_line##*$'\t'}"
+done
+SVC_OPTS_ALL=$(for k in "${!SVC_OPTS[@]}"; do printf '%s\t%s\n' "$k" "${SVC_OPTS[$k]}"; done | python3 -c 'import json, sys
+print(json.dumps({l.split("\t", 1)[0]: json.loads(l.split("\t", 1)[1]) for l in sys.stdin.read().splitlines() if l}))')
+local -a ORDERED_SERVICES=()
+local o_name
+while read -r o_name; do
+    for svc_line in "${SERVICES[@]}"; do
+        [ "${svc_line%%$'\t'*}" = "$o_name" ] && ORDERED_SERVICES+=("$svc_line")
+    done
+done <<< "$ordered"
+SERVICES=("${ORDERED_SERVICES[@]}")
+
 # Per-service VMID and address, checked against existing containers
 declare -A SVC_VMID SVC_IP SVC_ALIAS
 local plan_line p_name p_vmid p_ip p_alias
@@ -1403,7 +1597,12 @@ for SERVICE_LINE in "${SERVICES[@]}"; do
     _apply_runtime "$CURRENT_VMID" "" "" "$(_template_path "$TEMPLATE_VOLID")" "$S_ENV_JSON" "$S_OPTS_JSON" | sed -n 's/^\(SET\|WARN\|NOTE\)\t/  /p'
     echo "Environment variables set."
 
-    # --- 7. Start ---
+    # Boot order (PVE startup) follows the dependency order
+    SVC_POSITION=$(( ${SVC_POSITION:-0} + 1 ))
+    pct set "$CURRENT_VMID" --startup "$(_startup_value "$S_NAME" "$SVC_POSITION")" >/dev/null
+
+    # --- 7. Start (after its dependencies are up / healthy) ---
+    _wait_for_deps "$S_NAME" || echo "Warning: starting $S_NAME although a dependency is not ready"
     echo "Starting container..."
     pct start $CURRENT_VMID || echo "Warning: Container $CURRENT_VMID failed to start."
     echo "Service $S_NAME deployed to $CURRENT_VMID"
@@ -1758,7 +1957,12 @@ update_service() {
         esac
     done < <(_apply_runtime "$vmid" "$backup" "$(_template_path "$old_template")" "$(_template_path "$TEMPLATE_VOLID")" "$env_json" "$opts_json")
 
+    if [ "$(python3 -c 'import json, sys; print(bool((json.loads(sys.argv[1] or "{}").get("depends_on")) or any(sys.argv[2] in (o.get("depends_on") or {}) for o in json.loads(sys.argv[3] or "{}").values())))' "$opts_json" "$name" "$SVC_OPTS_ALL")" = "True" ]; then
+        pct set "$vmid" --startup "$(_startup_value "$name" "$UPDATE_POSITION")" >/dev/null
+    fi
+
     if [ "$was_running" = "true" ]; then
+        _wait_for_deps "$name" || echo "Warning: starting $name although a dependency is not ready"
         echo "Starting container $vmid..."
         pct start "$vmid" || echo "Warning: Container $vmid failed to start."
     fi
@@ -1873,6 +2077,28 @@ for s in json.load(open(sys.argv[1])).get("services", []):
         return 1
     fi
 
+    # Dependency order, and name -> vmid / options for dependency waits
+    local ordered
+    if ! ordered=$(_service_order); then
+        _notify "Error: invalid depends_on. Nothing was changed."
+        return 1
+    fi
+    declare -A SVC_OPTS=() SVC_VMID=()
+    local svc_line o_name
+    for svc_line in "${SERVICES[@]}"; do
+        SVC_OPTS["${svc_line%%$'\t'*}"]="${svc_line##*$'\t'}"
+    done
+    for o_name in "${!vmid_of[@]}"; do SVC_VMID["$o_name"]="${vmid_of[$o_name]}"; done
+    SVC_OPTS_ALL=$(for o_name in "${!SVC_OPTS[@]}"; do printf '%s\t%s\n' "$o_name" "${SVC_OPTS[$o_name]}"; done | python3 -c 'import json, sys
+print(json.dumps({l.split("\t", 1)[0]: json.loads(l.split("\t", 1)[1]) for l in sys.stdin.read().splitlines() if l}))')
+    local -a ordered_services=()
+    while read -r o_name; do
+        for svc_line in "${SERVICES[@]}"; do
+            [ "${svc_line%%$'\t'*}" = "$o_name" ] && ordered_services+=("$svc_line")
+        done
+    done <<< "$ordered"
+    SERVICES=("${ordered_services[@]}")
+
     DATA_DIR="${DATA_DIR:-$PROJECT_DIR/volumes}"
     declare -A SVC_VOLS=()
     local v_kind v_svc v_a v_b v_c v_d v_e
@@ -1892,8 +2118,9 @@ for s in json.load(open(sys.argv[1])).get("services", []):
         return 0
     fi
 
-    # 4. Update each service
+    # 4. Update each service (dependencies first)
     local failed=0
+    UPDATE_POSITION=0
     for line in "${SERVICES[@]}"; do
         IFS=$'\t' read -r S_NAME S_IMAGE S_ENV_JSON S_VOLS_JSON S_OPTS_JSON <<< "$line"
         if [ -z "${vmid_of[$S_NAME]}" ]; then
@@ -1901,6 +2128,7 @@ for s in json.load(open(sys.argv[1])).get("services", []):
             continue
         fi
         UPDATED_TEMPLATE=""
+        UPDATE_POSITION=$(( ${UPDATE_POSITION:-0} + 1 ))
         if update_service "$S_NAME" "${vmid_of[$S_NAME]}" "$S_IMAGE" "$S_ENV_JSON" "$S_VOLS_JSON" "${template_of[$S_NAME]}" "$S_OPTS_JSON"; then
             _set_service_template "$S_NAME" "$UPDATED_TEMPLATE"
         else
