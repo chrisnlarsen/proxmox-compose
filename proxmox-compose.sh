@@ -289,13 +289,14 @@ for name, service in data["services"].items():
             parts = v.split(":")
             source = parts[0]
             target = parts[1] if len(parts) > 1 else source
+            ro = len(parts) > 2 and "ro" in parts[2].split(",")
             v_type = "bind" if source.startswith((".", "/", "~")) else "global"
-            volumes.append({"type": v_type, "source": source, "target": target})
+            volumes.append({"type": v_type, "source": source, "target": target, "ro": ro})
         elif isinstance(v, dict):
             source, target = v.get("source"), v.get("target")
-            v_type = "bind" if v.get("type") == "bind" else "global"
+            v_type = "bind" if v.get("type") == "bind" or str(source).startswith((".", "/", "~")) else "global"
             if source and target:
-                volumes.append({"type": v_type, "source": source, "target": target})
+                volumes.append({"type": v_type, "source": source, "target": target, "ro": bool(v.get("read_only"))})
 
     # Runtime options
     limits = ((service.get("deploy") or {}).get("resources") or {}).get("limits") or {}
@@ -802,7 +803,7 @@ with open("'$METADATA_FILE'", "w") as f:
 
 _save_project_config() {
     # Update config section of metadata
-    python3 - "$METADATA_FILE" "$TARGET_NODE" "$TEMPLATE_STORAGE" "$ROOTFS_STORAGE" "$VOL_STORAGE" "$VOL_SIZE" "$NET_BRIDGE" "$IP_CONFIG" "$NET_CIDR" "$NET_GW" "$NET_TAG" <<'EOF'
+    python3 - "$METADATA_FILE" "$TARGET_NODE" "$TEMPLATE_STORAGE" "$ROOTFS_STORAGE" "$VOL_STORAGE" "$VOL_SIZE" "$NET_BRIDGE" "$IP_CONFIG" "$NET_CIDR" "$NET_GW" "$NET_TAG" "$DATA_DIR" <<'EOF'
 import json, sys
 meta_path = sys.argv[1]
 try:
@@ -821,7 +822,8 @@ data["config"] = {
     "ip_config": sys.argv[8],
     "net_cidr": sys.argv[9],
     "net_gw": sys.argv[10],
-    "net_tag": sys.argv[11]
+    "net_tag": sys.argv[11],
+    "data_dir": sys.argv[12]
 }
 
 with open(meta_path, "w") as f:
@@ -848,6 +850,7 @@ try:
         print(f'NET_CIDR="{cfg.get("net_cidr", "")}"')
         print(f'NET_GW="{cfg.get("net_gw", "")}"')
         print(f'NET_TAG="{cfg.get("net_tag", "")}"')
+        print(f'DATA_DIR="{cfg.get("data_dir", "")}"')
         print("CONFIG_LOADED=true")
     else:
         print("CONFIG_LOADED=false")
@@ -897,7 +900,7 @@ out = {
     "TARGET_NODE": x.get("node"), "TEMPLATE_STORAGE": x.get("template_storage"),
     "ROOTFS_STORAGE": x.get("rootfs_storage"), "VOL_STORAGE": x.get("volume_storage"),
     "VOL_SIZE": x.get("volume_size"), "NET_BRIDGE": x.get("bridge"), "NET_TAG": x.get("tag"),
-    "NET_GW": x.get("gateway"), "START_VMID": x.get("vmid"),
+    "NET_GW": x.get("gateway"), "START_VMID": x.get("vmid"), "DATA_DIR": x.get("data_dir"),
 }
 ip = x.get("ip")
 if ip:
@@ -919,11 +922,125 @@ _require_setting() {
     fi
 }
 
+# Decide how every compose volume is provided (all services at once, since
+# sharing matters). Prints tab-separated lines:
+#   VOL <service> <kind> <source> <target> <host path or "-"> <ro 0|1>
+#     kind: volume (new PVE volume, backed up with the CT)
+#           bind   (existing absolute host path)
+#           shared (host directory under DATA_DIR, used by several services)
+#           missing (update only: absolute host path that doesn't exist; fine
+#                    if the container already provides that mount point)
+#   SKIP <service> <source> <reason>
+#   ERROR <message>
+# Arg: "install" (missing host paths are errors) or "update".
+_plan_volumes() {
+    printf '%s\n' "${SERVICES[@]}" > "$TMP_DIR/services.tsv"
+    python3 - "$TMP_DIR/services.tsv" "$DATA_DIR" "${1:-install}" <<'EOF'
+import json, os, sys
+services_file, data_dir, mode = sys.argv[1:4]
+rows = []
+for line in open(services_file).read().splitlines():
+    if line.strip():
+        name, _img, _env, vols, _opts = line.split("\t")
+        rows.append((name, json.loads(vols)))
+
+def key(v):
+    src = os.path.expanduser(v["source"])
+    if src.startswith("/"):
+        return None
+    return os.path.normpath(src).lstrip("./") or "root"
+
+users = {}
+for name, vols in rows:
+    for v in vols:
+        k = key(v)
+        if k:
+            users.setdefault(k, set()).add(name)
+
+errors = []
+for name, vols in rows:
+    for v in vols:
+        src, tgt, ro = v["source"], v["target"], "1" if v.get("ro") else "0"
+        k = key(v)
+        if k is None:
+            path = os.path.expanduser(src)
+            if os.path.basename(path) == "docker.sock":
+                print(f"SKIP\t{name}\t{src}\tthere is no Docker on a Proxmox host")
+            elif os.path.exists(path):
+                print(f"VOL\t{name}\tbind\t{src}\t{tgt}\t{path}\t{ro}")
+            elif mode == "update":
+                print(f"VOL\t{name}\tmissing\t{src}\t{tgt}\t{path}\t{ro}")
+            else:
+                errors.append(f"service {name}: host path {path} does not exist (create it, or use a relative path / named volume)")
+        elif len(users[k]) > 1:
+            print(f"VOL\t{name}\tshared\t{src}\t{tgt}\t{os.path.join(data_dir, k)}\t{ro}")
+        else:
+            print(f"VOL\t{name}\tvolume\t{src}\t{tgt}\t-\t{ro}")
+for e in errors:
+    print(f"ERROR\t{e}")
+EOF
+}
+
+# Bind mounts into unprivileged containers are made as a mapped uid, so every
+# directory above a bind-mounted path must be traversable by "other" (o+x),
+# or the container fails to start.
+_check_traversable() {
+    local d="$1" blocked=""
+    while [ "$d" != "/" ] && [ -n "$d" ]; do
+        [ $(( $(stat -c %a "$d") % 10 & 1 )) -eq 1 ] || blocked="$blocked\n$d"
+        d=$(dirname "$d")
+    done
+    if [ -n "$blocked" ]; then
+        tui_msg "Error: $1 can't be bind-mounted into unprivileged containers because these directories are not world-traversable (o+x):$blocked\n\nUse another location (PMXC_BASE_DIR / x-pmxc.data_dir) or fix the permissions."
+        return 1
+    fi
+}
+
+# Attach one planned volume to a (stopped) container as mp<index>.
+# Prints the new PVE volid for kind "volume".
+_attach_volume() {
+    local vmid="$1" index="$2" kind="$3" target="$4" host_path="$5" ro="$6"
+    local opts="mp=$target${ro:+$( [ "$ro" = "1" ] && echo ",ro=1")}"
+    case "$kind" in
+        volume)
+            pct set "$vmid" "-mp$index" "$VOL_STORAGE:$(echo "$VOL_SIZE" | tr -cd '0-9'),$opts" >/dev/null || return 1
+            pct config "$vmid" | sed -n -E "s/^mp$index: ([^,]+).*/\1/p"
+            ;;
+        bind|shared)
+            pct set "$vmid" "-mp$index" "$host_path,$opts" >/dev/null || return 1
+            ;;
+    esac
+}
+
+# Make new shared directories writable by the containers that use them:
+# owned by the first non-root init user among them (mapped to the host uid).
+_own_shared_dirs() {
+    local dir svc vmid uid gid best_uid best_gid base
+    for dir in "${NEW_SHARED_DIRS[@]}"; do
+        best_uid="" best_gid=""
+        for svc in ${SHARED_USERS[$dir]}; do
+            vmid="${SVC_VMID[$svc]}"
+            uid=$(sed -n 's/^lxc.init.uid: //p' "/etc/pve/lxc/$vmid.conf" | head -n 1)
+            gid=$(sed -n 's/^lxc.init.gid: //p' "/etc/pve/lxc/$vmid.conf" | head -n 1)
+            uid="${uid:-0}"
+            if [ -z "$best_uid" ] || { [ "$best_uid" = "0" ] && [ "$uid" != "0" ]; }; then
+                best_uid="$uid" best_gid="${gid:-$uid}"
+            fi
+        done
+        base=$(sed -n -E 's/^lxc.idmap: u 0 ([0-9]+) .*/\1/p' "/etc/pve/lxc/${SVC_VMID[${SHARED_USERS[$dir]%% *}]}.conf" | head -n 1)
+        base="${base:-100000}"
+        chown "$((base + ${best_uid:-0})):$((base + ${best_gid:-0}))" "$dir"
+        chmod 2775 "$dir"
+        echo "Shared volume $dir owned by container uid ${best_uid:-0}"
+    done
+}
+
 # Plan a VMID and address for every service in SERVICES.
 # Explicit per-service `x-pmxc: {vmid, ip}` must be free; otherwise VMIDs count
 # up from START_VMID and addresses from NET_CIDR, skipping VMIDs in use.
-# Prints "PLAN<TAB>name<TAB>vmid<TAB>ip/cidr (empty for dhcp)<TAB>alias" or
-# "ERROR<TAB>message".
+# Prints "PLAN<TAB>name<TAB>vmid<TAB>ip/cidr ("-" for dhcp)<TAB>alias ("-" for
+# none)" or "ERROR<TAB>message". Empty fields are "-" because bash's read
+# treats tab as whitespace and would collapse them.
 _plan_services() {
     local used_ids used_ips
     used_ids=$(pvesh get /cluster/resources --type vm --output-format json 2>/dev/null)
@@ -984,7 +1101,7 @@ for name, o in services:
             err(f"address {iface.ip} for service {name} is already used by another guest")
         planned_ips.add(str(iface.ip))
         ip = str(iface)
-    print(f"PLAN\t{name}\t{vmid}\t{ip}\t{o.get('container_name') or ''}")
+    print(f"PLAN\t{name}\t{vmid}\t{ip or '-'}\t{o.get('container_name') or '-'}")
 EOF
 }
 
@@ -1013,7 +1130,7 @@ _net_ip_opts() {
 install_project() {
     created_vmids=()
     TARGET_NODE="" TEMPLATE_STORAGE="" ROOTFS_STORAGE="" VOL_STORAGE="" VOL_SIZE=""
-    NET_BRIDGE="" NET_TAG="" IP_CONFIG="" NET_CIDR="" NET_GW="" START_VMID=""
+    NET_BRIDGE="" NET_TAG="" IP_CONFIG="" NET_CIDR="" NET_GW="" START_VMID="" DATA_DIR=""
     # 1. Project Ingestion
     _ingest_project "$1" || return 1
     # COMPOSE_FILE and PROJECT_NAME are now set. METADATA_FILE is set.
@@ -1139,6 +1256,8 @@ for s in data:
         fi
     fi
     
+    DATA_DIR="${DATA_DIR:-$PROJECT_DIR/volumes}"
+
     # Save Config
     _save_project_config
 
@@ -1153,8 +1272,6 @@ for s in data:
         fi
     fi
 
-# Global Volume Tracking
-declare -A GLOBAL_VOL_MAP
 
 # 3. Parse Compose File
 echo "Parsing $COMPOSE_FILE..."
@@ -1175,6 +1292,8 @@ while IFS=$'\t' read -r plan_line p_name p_vmid p_ip p_alias; do
     case "$plan_line" in
         ERROR) tui_msg "Error: $p_name"; return 1 ;;
         PLAN)
+            [ "$p_ip" = "-" ] && p_ip=""
+            [ "$p_alias" = "-" ] && p_alias=""
             SVC_VMID["$p_name"]="$p_vmid"; SVC_IP["$p_name"]="$p_ip"; SVC_ALIAS["$p_name"]="$p_alias"
             echo "Planned: $p_name -> VMID $p_vmid, ${p_ip:-dhcp}" ;;
     esac
@@ -1184,18 +1303,34 @@ if [ ${#SVC_VMID[@]} -ne ${#SERVICES[@]} ]; then
     return 1
 fi
 
+# Volumes: decide bind / shared / PVE volume per service, before creating anything
+declare -A SVC_VOLS SHARED_USERS
+NEW_SHARED_DIRS=()
+local v_kind v_svc v_a v_b v_c v_d v_e
+while IFS=$'\t' read -r v_kind v_svc v_a v_b v_c v_d v_e; do
+    case "$v_kind" in
+        ERROR) tui_msg "Error: $v_svc"; return 1 ;;
+        SKIP) echo "Note: skipping volume $v_a of $v_svc: $v_b" ;;
+        VOL)
+            SVC_VOLS["$v_svc"]+="$v_a"$'\t'"$v_b"$'\t'"$v_c"$'\t'"$v_d"$'\t'"$v_e"$'\n'
+            if [ "$v_a" = "shared" ]; then
+                case " ${SHARED_USERS[$v_d]} " in *" $v_svc "*) ;; *) SHARED_USERS["$v_d"]+="$v_svc " ;; esac
+            fi ;;
+    esac
+done < <(_plan_volumes)
+for d in "${!SHARED_USERS[@]}"; do
+    if [ ! -e "$d" ]; then
+        mkdir -p "$d" && NEW_SHARED_DIRS+=("$d")
+    fi
+    _check_traversable "$(dirname "$d")" || return 1
+done
+
 HOSTS_FILE=""
 if [ "$IP_CONFIG" = "static" ]; then
     HOSTS_FILE="$PROJECT_DIR/hosts"
     _write_hosts_file > "$HOSTS_FILE"
     chmod 644 "$HOSTS_FILE"
-    # Unprivileged containers bind-mount it as a mapped uid: every parent
-    # directory must be traversable by "other", or the container won't start.
-    blocked=$(d="$PROJECT_DIR"; while [ "$d" != "/" ]; do [ "$(( $(stat -c %a "$d") % 10 & 1 ))" -eq 1 ] || echo "$d"; d=$(dirname "$d"); done)
-    if [ -n "$blocked" ]; then
-        tui_msg "Error: $HOSTS_FILE is not reachable by unprivileged containers because these directories are not world-traversable (o+x):\n$blocked\n\nMove the project directory (PMXC_BASE_DIR) or fix the permissions."
-        return 1
-    fi
+    _check_traversable "$PROJECT_DIR" || return 1
 elif [ ${#SERVICES[@]} -gt 1 ]; then
     echo "Note: with DHCP, services can't reach each other by name (no hosts file). Use static addresses for multi-service projects."
 fi
@@ -1214,17 +1349,6 @@ for SERVICE_LINE in "${SERVICES[@]}"; do
     
     # Metadata for this service
     SERVICE_VOLUMES_LOG="[]"
-
-    # --- 1. Volume Processing Preparation ---
-    PENDING_VOLUMES=()
-    MP_INDEX=0
-    # Process S_VOLS_JSON into an array for later iteration
-    if [ -n "$S_VOLS_JSON" ] && [ "$S_VOLS_JSON" != "[]" ]; then
-         while read -r VOL_ITEM; do
-             [ -z "$VOL_ITEM" ] && continue
-             PENDING_VOLUMES+=("$VOL_ITEM")
-         done < <(echo "$S_VOLS_JSON" | python3 -c "import sys, json; print('\n'.join(['|'.join([v['type'], v['source'], v['target']]) for v in json.load(sys.stdin)]))")
-    fi
 
     # --- 2. Pull Image (sets TEMPLATE_VOLID) ---
     _pull_image "$S_IMAGE" || exit 1
@@ -1251,54 +1375,23 @@ for SERVICE_LINE in "${SERVICES[@]}"; do
     
     VMID_FOR_TRACKING=$CURRENT_VMID
 
-    # --- 5. Post-Creation Volume Attachment (pct set) ---
+    # --- 5. Volumes (planned above) ---
     echo "Processing volumes..."
     MP_INDEX=0
-    for VOL_ITEM in "${PENDING_VOLUMES[@]}"; do
-        [ -z "$VOL_ITEM" ] && continue
-        IFS='|' read -r V_TYPE V_SOURCE V_TARGET <<< "$VOL_ITEM"
-        
-        MOUNT_STR=""
-        IS_NEW_ALLOCATION="false"
-        PROXMOX_VOLID=""
-
-        # 1. Check Global Map (Current Session Shared)
-        if [[ -n "${GLOBAL_VOL_MAP[$V_SOURCE]}" ]]; then
-                PROXMOX_VOLID="${GLOBAL_VOL_MAP[$V_SOURCE]}"
-                echo "Attaching shared volume '$V_SOURCE': $PROXMOX_VOLID"
-                MOUNT_STR="$PROXMOX_VOLID,mp=$V_TARGET"
-        
-        # 2. Create New (pct set storage:size)
-        else
-                echo "Creating new volume for '$V_SOURCE'..."
-                # Syntax: storage:size (size in GB, numeric only)
-                MOUNT_STR="$VOL_STORAGE:$CLEAN_VOL_SIZE,mp=$V_TARGET"
-                IS_NEW_ALLOCATION="true"
+    while IFS=$'\t' read -r V_KIND V_SOURCE V_TARGET V_HOST V_RO; do
+        [ -z "$V_KIND" ] && continue
+        [ "$V_HOST" = "-" ] && V_HOST=""
+        echo "  $V_SOURCE -> $V_TARGET ($V_KIND${V_HOST:+: $V_HOST})"
+        if ! PROXMOX_VOLID=$(_attach_volume "$CURRENT_VMID" "$MP_INDEX" "$V_KIND" "$V_TARGET" "$V_HOST" "$V_RO"); then
+            echo "Error: Failed to attach volume $V_SOURCE to $CURRENT_VMID"
+            exit 1
         fi
-        
-        # Execute pct set
-        if [ -n "$MOUNT_STR" ]; then
-            pct set $CURRENT_VMID "-mp$MP_INDEX" "$MOUNT_STR" || { echo "Error: Failed to attach volume $V_SOURCE to $CURRENT_VMID"; exit 1; }
-             
-            # If we just created a new allocated volume, we MUST find its ID
-            if [ "$IS_NEW_ALLOCATION" == "true" ]; then
-                # Scrape config
-                NEW_VOL_CONFIG=$(pct config $CURRENT_VMID | grep "^mp$MP_INDEX:")
-                # Format: mp0: local-zfs:vm-800-disk-1,mp=/data,...
-                PROXMOX_VOLID=$(echo "$NEW_VOL_CONFIG" | sed -E 's/^mp[0-9]+: ([^,]+).*/\1/')
-            fi
-            
-            # Log for metadata (JSON object)
-            SAFE_SRC=$(echo "$V_SOURCE" | sed 's/"/\\"/g')
-            SAFE_VOL=$(echo "$PROXMOX_VOLID" | sed 's/"/\\"/g')
-            SAFE_MP=$(echo "$V_TARGET" | sed 's/"/\\"/g')
-            
-            VOL_ENTRY="{\"source\": \"$SAFE_SRC\", \"volid\": \"$SAFE_VOL\", \"mp\": \"$SAFE_MP\", \"type\": \"$V_TYPE\"}"
-            SERVICE_VOLUMES_LOG=$(echo "$SERVICE_VOLUMES_LOG" | python3 -c "import sys, json; l=json.load(sys.stdin); l.append($VOL_ENTRY); print(json.dumps(l))")
-            
-            MP_INDEX=$((MP_INDEX + 1))
+        if [ "$V_KIND" = "volume" ]; then
+            SERVICE_VOLUMES_LOG=$(python3 -c 'import json, sys; l = json.loads(sys.argv[1]); l.append({"source": sys.argv[2], "volid": sys.argv[3], "mp": sys.argv[4], "type": "volume"}); print(json.dumps(l))' \
+                "$SERVICE_VOLUMES_LOG" "$V_SOURCE" "$PROXMOX_VOLID" "$V_TARGET")
         fi
-    done
+        MP_INDEX=$((MP_INDEX + 1))
+    done <<< "${SVC_VOLS[$S_NAME]}"
 
     # Service-name resolution: bind the project hosts file over /etc/hosts
     if [ -n "$HOSTS_FILE" ]; then
@@ -1332,6 +1425,8 @@ print(json.dumps(services))
 
     created_vmids+=("$VMID_FOR_TRACKING")
 done
+
+    _own_shared_dirs
 
     # Finalize Metadata
     echo "Updating project metadata..."
@@ -1619,17 +1714,32 @@ update_service() {
     PARKED_VOLUMES_ON=""
     pct destroy "$stage" --purge >/dev/null 2>&1 || echo "Warning: could not remove staging container $stage"
 
-    # Compose volumes that don't exist yet get a new disk
-    local v_type v_source v_target used n=0
-    while IFS=$'\t' read -r v_type v_source v_target; do
-        [ -z "$v_target" ] && continue
-        used="false"
-        for i in "${data_targets[@]}"; do [ "$i" = "$v_target" ] && used="true"; done
-        [ "$used" = "true" ] && continue
+    # Compose volumes whose mount point isn't provided yet (by a moved volume
+    # or a bind mount) are added according to the volume plan
+    local v_kind v_source v_target v_host v_ro n=0 volid
+    while IFS=$'\t' read -r v_kind v_source v_target v_host v_ro; do
+        [ -z "$v_kind" ] && continue
+        [ "$v_host" = "-" ] && v_host=""
+        if grep -q -E "^mp[0-9]+: [^,]+,(.*,)?mp=$v_target(,|$)" "$conf"; then
+            continue
+        fi
+        if [ "$v_kind" = "missing" ]; then
+            echo "Warning: $v_target is not mounted: host path $v_host does not exist"
+            continue
+        fi
         while grep -q "^mp$n:" "$conf"; do n=$((n + 1)); done
-        echo "Creating new volume for '$v_source' at $v_target..."
-        pct set "$vmid" "-mp$n" "$VOL_STORAGE:$(echo "$VOL_SIZE" | tr -cd '0-9'),mp=$v_target" || echo "Warning: could not create volume for $v_target"
-    done < <(echo "$vols_json" | python3 -c "import sys, json; [print(f\"{v['type']}\t{v['source']}\t{v['target']}\") for v in json.load(sys.stdin)]")
+        if [ "$v_kind" = "shared" ] && [ ! -e "$v_host" ]; then
+            mkdir -p "$v_host"
+            local base uid gid
+            base=$(sed -n -E 's/^lxc.idmap: u 0 ([0-9]+) .*/\1/p' "$conf" | head -n 1)
+            uid=$(sed -n 's/^lxc.init.uid: //p' "$conf" | head -n 1)
+            gid=$(sed -n 's/^lxc.init.gid: //p' "$conf" | head -n 1)
+            chown "$(( ${base:-100000} + ${uid:-0} )):$(( ${base:-100000} + ${gid:-${uid:-0}} ))" "$v_host"
+            chmod 2775 "$v_host"
+        fi
+        echo "Adding volume '$v_source' at $v_target ($v_kind${v_host:+: $v_host})"
+        volid=$(_attach_volume "$vmid" "$n" "$v_kind" "$v_target" "$v_host" "$v_ro") || echo "Warning: could not add volume for $v_target"
+    done <<< "${SVC_VOLS[$name]}"
 
     # 6. Runtime settings: new image defaults, previous customisations
     #    (entrypoint, env, init user/cwd) and the compose environment
@@ -1762,6 +1872,16 @@ for s in json.load(open(sys.argv[1])).get("services", []):
         _notify "Error: No services found in $COMPOSE_FILE."
         return 1
     fi
+
+    DATA_DIR="${DATA_DIR:-$PROJECT_DIR/volumes}"
+    declare -A SVC_VOLS=()
+    local v_kind v_svc v_a v_b v_c v_d v_e
+    while IFS=$'\t' read -r v_kind v_svc v_a v_b v_c v_d v_e; do
+        case "$v_kind" in
+            ERROR) _notify "Error: $v_svc. Nothing was changed."; return 1 ;;
+            VOL) SVC_VOLS["$v_svc"]+="$v_a"$'\t'"$v_b"$'\t'"$v_c"$'\t'"$v_d"$'\t'"$v_e"$'\n' ;;
+        esac
+    done < <(_plan_volumes update)
 
     local summary="" line S_NAME S_IMAGE S_ENV_JSON S_VOLS_JSON S_OPTS_JSON
     for line in "${SERVICES[@]}"; do

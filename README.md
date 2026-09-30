@@ -86,9 +86,21 @@ An update refuses to start for a container that has **snapshots** (PVE cannot mo
 | `shm_size` | A sized tmpfs on `/dev/shm` |
 | `restart` | `onboot` (`no` → off, anything else → on) |
 | `mem_limit`, `cpus`, `deploy.resources.limits` | `memory`, `cores` |
-| `volumes` | Container volumes (see Features) |
+| `volumes` | Mount points, see [Volumes](#volumes) |
 | `x-pmxc: {cores, memory, swap, rootfs_size, vmid, ip}` | Proxmox-specific overrides per service (memory in MB, rootfs in GB; `ip` with or without `/prefix`) |
 | `container_name` | Extra name for the service in the project hosts file |
+
+### Volumes
+
+| Compose volume | Becomes |
+|---|---|
+| Absolute path that exists on the host (`/srv/app:/data`) | A bind mount of that path |
+| Absolute path that doesn't exist | An error before anything is created |
+| `/var/run/docker.sock` | Skipped (no Docker on a Proxmox host) |
+| Relative path or named volume used by **one** service (`./data:/data`, `db:/var/lib/db`) | A PVE volume on `volume_storage` (included in container backups) |
+| Relative path or named volume used by **several** services | A host directory under `x-pmxc.data_dir` (default `<project>/volumes/<name>`) bind-mounted into each; owned by the first non-root container user so all of them can write |
+
+`:ro` / `read_only: true` make the mount read-only. On update, mount points the container already has are kept; volumes new in the compose file are added the same way.
 
 ### Networking and service names
 
@@ -127,8 +139,8 @@ A local compose file's `.env` and `env_file` files are copied into the project; 
 *   **OCI Extraction Errors**: Some images (e.g., `postgres:14-alpine`, some `node` images) fail to extract on Proxmox/LXC due to hardlink handling on ZFS. This presents as `IO error: failed to unpack ... File exists`.
     *   *Workaround*: Try using a different base image (e.g., `debian`) or wait for upstream Proxmox fixes.
 *   **Restart Policies**: Does not currently map `restart` policies to Proxmox startup options.
-*   **Not supported yet**: `depends_on`/`healthcheck` ordering and volumes shared between services. `ports` are ignored (each container has its own IP).
-*   **Project directory permissions**: the hosts file is bind-mounted into unprivileged containers, so every directory above the project directory must be world-traversable (the default `/var/lib/proxmox-compose` is). The installer checks this.
+*   **Not supported yet**: `depends_on`/`healthcheck` ordering. `ports` are ignored (each container has its own IP).
+*   **Project directory permissions**: the hosts file and shared volumes are bind-mounted into unprivileged containers, so every directory above them must be world-traversable (the default `/var/lib/proxmox-compose` is). The installer checks this.
 *   **Unknown build image**: if a container's original template is no longer on disk, the update can't tell image defaults from customisations. It keeps the entrypoint and init user/cwd as they are, lets the new image set the environment variables it defines, and lists the ones it replaced.
 *   **Deleting a project and keeping data**: PVE deletes every volume a container owns when it is destroyed, so "keep data" leaves the containers stopped (tagged `pmxc-detached`, onboot off) instead of destroying them.
 
