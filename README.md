@@ -42,12 +42,34 @@ chmod +x proxmox-compose.sh
         *   If `static`: Enter CIDR (e.g., `192.168.1.10/24`) and Gateway.
     *   **Starting VMID**: Confirm the starting ID for the new containers.
 
+### Updating a project
+
+From the menu choose **Manage Projects → Update Project**, or run it non-interactively (e.g. from cron):
+
+```bash
+./proxmox-compose.sh list                 # show projects
+./proxmox-compose.sh update <project>     # prompts for confirmation
+./proxmox-compose.sh update <project> -y  # no prompts; uses the local compose file
+```
+
+For each service the update:
+
+1. Pulls the image to a new, timestamped template (so `:latest` really is re-pulled) and creates a staging container from it. If either fails, nothing has been touched.
+2. Stops the service and moves its data volumes onto the staging container (`pct move-volume`).
+3. Destroys the old container **without** `--purge` (it stays in backup jobs/HA) and recreates it from the new image under the **same VMID**.
+4. Restores network config (MAC/IP), cores, memory, swap, tags, description, features, bind mounts and the container firewall rules, moves the data volumes back and re-applies the compose environment.
+5. Starts the service if it was running, removes the staging container and deletes old templates for that image (keeping the current and previous one).
+
+The previous container config (and firewall rules) are saved in the project directory as `<vmid>-<timestamp>.conf.bak` / `.fw.bak`.
+
+An update refuses to start for a container that has **snapshots** (PVE cannot move volumes used by a snapshot), **pending config changes**, or **protection** enabled.
+
 ## Features
 
 *   **Automatic Image Pulling**: Uses Proxmox API (`pvesh`) to pull OCI images from the registry defined in your compose file.
 *   **Advanced Networking**: Auto-detects available bridges from `/etc/network/interfaces`. Supports both DHCP and Static IP configuration per deployment.
 *   **Persistent Volumes**: Supports standard bindings (`./data:/data`) and global named volumes. Automatically allocates virtual disks on Proxmox storage and attaches them to containers.
-*   **Update Workflow**: **New!** Includes a "Update Project" option to safely detach persistent volumes, destroy only the container, pull the latest image, and re-deploy while preserving your data.
+*   **Update Workflow**: Rebuilds each container from a freshly pulled image under the same VMID while moving (never deleting) its data volumes. See [Updating a project](#updating-a-project).
 *   **Environment Variables**: Parses `environment` sections and injects them into the container configuration (`lxc.environment`).
 *   **Container Creation**: Automatically creates unprivileged LXC containers for each service.
 
@@ -56,6 +78,9 @@ chmod +x proxmox-compose.sh
 *   **OCI Extraction Errors**: Some images (e.g., `postgres:14-alpine`, some `node` images) fail to extract on Proxmox/LXC due to hardlink handling on ZFS. This presents as `IO error: failed to unpack ... File exists`.
     *   *Workaround*: Try using a different base image (e.g., `debian`) or wait for upstream Proxmox fixes.
 *   **Restart Policies**: Does not currently map `restart` policies to Proxmox startup options.
+*   **Compose support is partial**: only `image`, `environment` and `volumes` are read. `env_file`, `.env`/`${VAR}` interpolation, `command`, `entrypoint` and `depends_on` are not supported yet.
+*   **Environment on update**: variables come from the new image plus the compose file. Variables that were added to a container config by hand are reported but not carried over.
+*   **Deleting a project and keeping data**: PVE deletes every volume a container owns when it is destroyed, so "keep data" leaves the containers stopped (tagged `pmxc-detached`, onboot off) instead of destroying them.
 
 ## Disclaimer
 
